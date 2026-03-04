@@ -148,20 +148,29 @@ enum bp_scope
     SCOPE_ALL_THREADS    // 全部线程
 };
 
-// 存储命中信息
-struct hwbp_info
+// 记录单个 PC（触发指令地址）的命中状态
+struct hwbp_record
 {
-    uint64_t num_brps;  // 执行断点的数量
-    uint64_t num_wrps;  // 访问断点的数量
-    uint64_t hit_addr;  // 监控地址
-    uint64_t hit_count; // 命中次数
-    uint64_t regs[30];  // X0 ~ X29 寄存器
+    uint64_t pc;        // 触发断点的汇编指令地址
+    uint64_t hit_count; // 该 PC 命中的次数
+    uint64_t regs[30];  // 最新的 X0 ~ X29 寄存器
     uint64_t lr;        // X30
     uint64_t sp;        // Stack Pointer
-    uint64_t pc;        // 触发断点的汇编指令地址
-    uint64_t orig_x0;   // 原始 X0 (用于系统调用重启)
+    uint64_t orig_x0;   // 原始 X0
     uint64_t syscallno; // 系统调用号
     uint64_t pstate;    // 处理器状态
+};
+
+// 存储整体命中信息
+struct hwbp_info
+{
+    uint64_t num_brps; // 执行断点的数量
+    uint64_t num_wrps; // 访问断点的数量
+    uint64_t hit_addr; // 监控的地址
+
+    // 记录不同 PC 触发状态的数组
+    struct hwbp_record records[0x100];
+    int record_count; // 当前已记录的不同 PC 数量
 };
 
 // 链表节点，用于保存注册的 perf_event 指针，方便后续删除
@@ -171,12 +180,14 @@ struct bp_node
     struct list_head list;
 };
 static LIST_HEAD(bp_event_list);
-static DEFINE_MUTEX(bp_list_mutex); // 保护链表的互斥锁
+// 保护全局断点事件链表的互斥锁（允许睡眠，用于注册/注销断点）
+static DEFINE_MUTEX(bp_list_mutex);
+// 保护 hwbp_info 数据记录的全局自旋锁（禁止睡眠，用于中断回调中保护数据）
+static DEFINE_SPINLOCK(hwbp_record_lock);
 
 // 断点触发回调函数
 static void sample_hbp_handler(struct perf_event *bp, struct perf_sample_data *data, struct pt_regs *regs)
 {
-
     static uint64_t static_orig_addr = 0;   // 原始监控的地址
     static bool static_is_stepping = false; // 乒乓状态机标记
     static int static_slot_idx = -1;        // 记录该断点被分配到了哪个硬件槽位
@@ -184,6 +195,8 @@ static void sample_hbp_handler(struct perf_event *bp, struct perf_sample_data *d
     // 从 perf_event 中提取注册时传入的 context 指针
     struct hwbp_info *info = (struct hwbp_info *)bp->overflow_handler_context;
 
+    unsigned long flags;
+    struct hwbp_record *rec = NULL;
     int i;
     int max_slots;
     uint64_t current_hw_addr;
@@ -200,19 +213,42 @@ static void sample_hbp_handler(struct perf_event *bp, struct perf_sample_data *d
         // 自动从内核属性中获取并记录原始地址
         static_orig_addr = bp->attr.bp_addr;
 
-        info->hit_addr = bp->attr.bp_addr;
-        info->hit_count++;
+        spin_lock_irqsave(&hwbp_record_lock, flags);
 
-        //  X0 ~ X29
-        memcpy(info->regs, regs->regs, sizeof(u64) * 30);
+        info->hit_addr = static_orig_addr;
 
-        // ARM64 pt_regs 中, regs[30] 是 LR
-        info->lr = regs->regs[30];
-        info->sp = regs->sp;
-        info->pc = regs->pc;
-        info->orig_x0 = regs->orig_x0;
-        info->syscallno = regs->syscallno;
-        info->pstate = regs->pstate;
+        // 查找当前 PC 是否已经在数组中记录过
+        for (i = 0; i < info->record_count; i++)
+        {
+            if (info->records[i].pc == regs->pc)
+            {
+                rec = &info->records[i];
+                break;
+            }
+        }
+
+        //  如果没找到，并且数组没满 (0x100 = 256)，分配一个新的槽位
+        if (!rec && info->record_count < 0x100)
+        {
+            rec = &info->records[info->record_count];
+            rec->pc = regs->pc;
+            rec->hit_count = 0;
+            info->record_count++;
+        }
+
+        // 更新对应的寄存器状态和次数
+        if (rec)
+        {
+            rec->hit_count++;
+            memcpy(rec->regs, regs->regs, sizeof(u64) * 30);
+            rec->lr = regs->regs[30];
+            rec->sp = regs->sp;
+            rec->orig_x0 = regs->orig_x0;
+            rec->syscallno = regs->syscallno;
+            rec->pstate = regs->pstate;
+        }
+
+        spin_unlock_irqrestore(&hwbp_record_lock, flags);
 
         pr_info("【命中记录】目标地址: 0x%llx, 当前PC: 0x%llx\n", static_orig_addr, regs->pc);
 
@@ -230,7 +266,6 @@ static void sample_hbp_handler(struct perf_event *bp, struct perf_sample_data *d
 
         if (static_slot_idx != -1)
         {
-
             next_pc = regs->pc + 4;
             if (is_execute_bp)
                 write_bvr(static_slot_idx, next_pc);
@@ -244,7 +279,6 @@ static void sample_hbp_handler(struct perf_event *bp, struct perf_sample_data *d
     {
         if (static_slot_idx != -1)
         {
-
             if (is_execute_bp)
                 write_bvr(static_slot_idx, static_orig_addr);
             else
@@ -254,7 +288,6 @@ static void sample_hbp_handler(struct perf_event *bp, struct perf_sample_data *d
         static_is_stepping = false;
     }
 }
-
 // 设置进程断点
 int set_process_hwbp(pid_t pid, uint64_t addr, enum bp_type type, enum bp_scope scope, int len_bytes, struct hwbp_info *info)
 {
@@ -334,10 +367,6 @@ int set_process_hwbp(pid_t pid, uint64_t addr, enum bp_type type, enum bp_scope 
     // 必须明确排除内核态，只监听用户态进程
     attr.exclude_kernel = 1;
     attr.exclude_hv = 1;
-
-    // 必须指定采样周期为 1 ，意思是每一次命中都要通知我
-    // 这会让 perf 子系统启用正确的硬件单步步过机制
-    attr.sample_period = 1;
 
     // 获取目标进程
     rcu_read_lock();

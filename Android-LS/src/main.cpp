@@ -3110,6 +3110,11 @@ private:
             UI::Text({0.5f, 0.5f, 0.5f, 1}, "○ 断点未激活");
         }
 
+        if (info.hit_addr)
+        {
+            UI::Text({0.5f, 0.85f, 0.85f, 1}, "监控地址: 0x%llX", (unsigned long long)info.hit_addr);
+        }
+
         UI::Space(S(8));
         ImGui::Separator();
         UI::Space(S(6));
@@ -3118,92 +3123,165 @@ private:
         UI::Text({0.9f, 0.7f, 0.4f, 1}, "━━ 命中信息 ━━");
         UI::Space(S(4));
 
-        if (info.hit_count > 0)
+        if (info.record_count > 0)
         {
-            UI::Text({1, 0.8f, 0.3f, 1}, "命中次数: %llu", (unsigned long long)info.hit_count);
-            UI::Text({0.5f, 1, 0.5f, 1}, "命中地址: 0x%llX", (unsigned long long)info.pc);
-            UI::Space(S(4));
+            uint64_t totalHits = 0;
+            for (int r = 0; r < info.record_count; ++r)
+                totalHits += info.records[r].hit_count;
 
-            // PC / LR / SP
-            UI::Text({0.7f, 0.85f, 1, 1}, "PC: ");
-            ImGui::SameLine();
-            UI::Text({0.5f, 1, 0.5f, 1}, "0x%llX", (unsigned long long)info.pc);
-            ImGui::SameLine();
-            if (UI::Btn("复制##pc", {S(50), S(28)}, {0.25f, 0.35f, 0.5f, 1}))
-            {
-                char tmp[32];
-                snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)info.pc);
-                ImGui::SetClipboardText(tmp);
-            }
-
-            UI::Text({0.7f, 0.85f, 1, 1}, "LR: ");
-            ImGui::SameLine();
-            UI::Text({0.5f, 1, 0.5f, 1}, "0x%llX", (unsigned long long)info.lr);
-            ImGui::SameLine();
-            if (UI::Btn("复制##lr", {S(50), S(28)}, {0.25f, 0.35f, 0.5f, 1}))
-            {
-                char tmp[32];
-                snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)info.lr);
-                ImGui::SetClipboardText(tmp);
-            }
-
-            UI::Text({0.7f, 0.85f, 1, 1}, "SP: ");
-            ImGui::SameLine();
-            UI::Text({0.5f, 1, 0.5f, 1}, "0x%llX", (unsigned long long)info.sp);
-
-            UI::Space(S(4));
-
-            // PSTATE / SYSCALL / ORIG_X0
-            UI::Text({0.6f, 0.6f, 0.65f, 1}, "PSTATE: 0x%llX", (unsigned long long)info.pstate);
-            UI::Text({0.6f, 0.6f, 0.65f, 1}, "SYSCALL: %llu", (unsigned long long)info.syscallno);
-            UI::Text({0.6f, 0.6f, 0.65f, 1}, "ORIG_X0: 0x%llX", (unsigned long long)info.orig_x0);
-
+            UI::Text({1, 0.8f, 0.3f, 1}, "不同PC数: %d  总命中: %llu",
+                     info.record_count, (unsigned long long)totalHits);
             UI::Space(S(6));
-            ImGui::Separator();
-            UI::Space(S(4));
 
-            // 通用寄存器 X0~X29
-            UI::Text({0.9f, 0.7f, 0.4f, 1}, "━━ 通用寄存器 ━━");
-            UI::Space(S(4));
+            int deleteIdx = -1; // 记录待删除的索引
 
-            ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, {S(4), S(4)});
-            if (ImGui::BeginTable("Regs", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+            for (int r = 0; r < info.record_count; ++r)
             {
-                ImGui::TableSetupColumn("寄存器", ImGuiTableColumnFlags_WidthFixed, S(55));
-                ImGui::TableSetupColumn("值", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("操作", ImGuiTableColumnFlags_WidthFixed, S(50));
-                ImGui::TableHeadersRow();
+                const auto &rec = info.records[r];
+                ImGui::PushID(r);
 
-                for (int i = 0; i < 30; ++i)
+                // 一行：信息文本 + 展开按钮 + 删除按钮
+                float btnW = S(55), btnH = S(32);
+                float expandW = S(45);
+
+                // PC信息文本
+                UI::Text({0.7f, 0.85f, 1, 1}, "[%d]", r);
+                ImGui::SameLine();
+                UI::Text({0.5f, 1, 0.5f, 1}, "PC:0x%llX", (unsigned long long)rec.pc);
+                ImGui::SameLine();
+                UI::Text({1, 0.8f, 0.3f, 1}, "x%llu", (unsigned long long)rec.hit_count);
+
+                // 删除按钮放最右
+                ImGui::SameLine(w - btnW);
+                if (UI::Btn("删除", {btnW, btnH}, {0.6f, 0.15f, 0.15f, 1}))
                 {
-                    ImGui::TableNextRow();
-                    ImGui::PushID(i);
+                    deleteIdx = r;
+                }
 
-                    ImGui::TableSetColumnIndex(0);
-                    UI::Text({0.7f, 0.85f, 1, 1}, "X%d", i);
+                // 展开/收起按钮
+                // 用 static 数组记录每个 record 的展开状态
+                static bool expandState[0x100] = {};
+                ImGui::SameLine(w - btnW - expandW - S(4));
+                if (UI::Btn(expandState[r] ? "收起" : "展开", {expandW, btnH}, {0.2f, 0.3f, 0.45f, 1}))
+                {
+                    expandState[r] = !expandState[r];
+                }
 
-                    ImGui::TableSetColumnIndex(1);
-                    UI::Text({0.5f, 1, 0.5f, 1}, "0x%llX", (unsigned long long)info.regs[i]);
+                if (expandState[r])
+                {
+                    ImGui::Indent(S(8));
 
-                    ImGui::TableSetColumnIndex(2);
-                    if (UI::Btn("复制", {S(42), S(28)}, {0.25f, 0.35f, 0.5f, 1}))
+                    // PC / LR / SP
+                    UI::Text({0.7f, 0.85f, 1, 1}, "PC: ");
+                    ImGui::SameLine();
+                    UI::Text({0.5f, 1, 0.5f, 1}, "0x%llX", (unsigned long long)rec.pc);
+                    ImGui::SameLine();
+                    if (UI::Btn("复制##pc", {S(50), S(28)}, {0.25f, 0.35f, 0.5f, 1}))
                     {
                         char tmp[32];
-                        snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)info.regs[i]);
+                        snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)rec.pc);
                         ImGui::SetClipboardText(tmp);
                     }
 
-                    ImGui::PopID();
+                    UI::Text({0.7f, 0.85f, 1, 1}, "LR: ");
+                    ImGui::SameLine();
+                    UI::Text({0.5f, 1, 0.5f, 1}, "0x%llX", (unsigned long long)rec.lr);
+                    ImGui::SameLine();
+                    if (UI::Btn("复制##lr", {S(50), S(28)}, {0.25f, 0.35f, 0.5f, 1}))
+                    {
+                        char tmp[32];
+                        snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)rec.lr);
+                        ImGui::SetClipboardText(tmp);
+                    }
+
+                    UI::Text({0.7f, 0.85f, 1, 1}, "SP: ");
+                    ImGui::SameLine();
+                    UI::Text({0.5f, 1, 0.5f, 1}, "0x%llX", (unsigned long long)rec.sp);
+                    ImGui::SameLine();
+                    if (UI::Btn("复制##sp", {S(50), S(28)}, {0.25f, 0.35f, 0.5f, 1}))
+                    {
+                        char tmp[32];
+                        snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)rec.sp);
+                        ImGui::SetClipboardText(tmp);
+                    }
+
+                    UI::Space(S(4));
+
+                    UI::Text({0.6f, 0.6f, 0.65f, 1}, "PSTATE:  0x%llX", (unsigned long long)rec.pstate);
+                    UI::Text({0.6f, 0.6f, 0.65f, 1}, "SYSCALL: %llu", (unsigned long long)rec.syscallno);
+                    UI::Text({0.6f, 0.6f, 0.65f, 1}, "ORIG_X0: 0x%llX", (unsigned long long)rec.orig_x0);
+                    UI::Text({1, 0.8f, 0.3f, 1}, "命中次数: %llu", (unsigned long long)rec.hit_count);
+
+                    UI::Space(S(6));
+
+                    UI::Text({0.9f, 0.7f, 0.4f, 1}, "━━ 通用寄存器 ━━");
+                    UI::Space(S(4));
+
+                    char tableId[32];
+                    snprintf(tableId, sizeof(tableId), "Regs##%d", r);
+
+                    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, {S(4), S(4)});
+                    if (ImGui::BeginTable(tableId, 3,
+                                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+                    {
+                        ImGui::TableSetupColumn("寄存器", ImGuiTableColumnFlags_WidthFixed, S(55));
+                        ImGui::TableSetupColumn("值", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn("操作", ImGuiTableColumnFlags_WidthFixed, S(50));
+                        ImGui::TableHeadersRow();
+
+                        for (int i = 0; i < 30; ++i)
+                        {
+                            ImGui::TableNextRow();
+                            ImGui::PushID(i);
+
+                            ImGui::TableSetColumnIndex(0);
+                            UI::Text({0.7f, 0.85f, 1, 1}, "X%d", i);
+
+                            ImGui::TableSetColumnIndex(1);
+                            UI::Text({0.5f, 1, 0.5f, 1}, "0x%llX", (unsigned long long)rec.regs[i]);
+
+                            ImGui::TableSetColumnIndex(2);
+                            if (UI::Btn("复制", {S(42), S(28)}, {0.25f, 0.35f, 0.5f, 1}))
+                            {
+                                char tmp[32];
+                                snprintf(tmp, sizeof(tmp), "%llX", (unsigned long long)rec.regs[i]);
+                                ImGui::SetClipboardText(tmp);
+                            }
+
+                            ImGui::PopID();
+                        }
+                        ImGui::EndTable();
+                    }
+                    ImGui::PopStyleVar();
+
+                    ImGui::Unindent(S(8));
                 }
-                ImGui::EndTable();
+
+                UI::Space(S(4));
+                ImGui::Separator();
+                UI::Space(S(4));
+
+                ImGui::PopID();
             }
-            ImGui::PopStyleVar();
+
+            // 遍历结束后删除
+            if (deleteIdx >= 0)
+            {
+                dr.RemoveHwbpRecord(deleteIdx);
+            }
+
+            // 在遍历结束后执行删除，避免遍历中修改数组
+            if (deleteIdx >= 0)
+            {
+                dr.RemoveHwbpRecord(deleteIdx);
+            }
         }
         else
         {
             UI::Text({0.5f, 0.5f, 0.5f, 1}, "暂无命中记录");
         }
     }
+
     void drawTabs(float w, float h)
     {
         ImGui::PushStyleColor(ImGuiCol_ChildBg, {0.1f, 0.1f, 0.12f, 1.0f});
@@ -3672,6 +3750,326 @@ int main()
 
     // 停所有线程
     Utils::GlobalPool.force_stop();
+
+    return 0;
+}
+
+struct RoundResult
+{
+    // 空IO
+    double nullIoTotalMs;
+    double nullIoAvgNs;
+    double nullIoThroughputK; // K ops/s
+
+    // 读取
+    double readTotalMs;
+    double readAvgNs;
+    double readNetAvgNs;
+    double readThroughputK;
+    double readBandwidthMB;
+    int readFailCount;
+
+    // 写入
+    double writeTotalMs;
+    double writeAvgNs;
+    double writeNetAvgNs;
+    double writeThroughputK;
+    double writeBandwidthMB;
+    int writeFailCount;
+
+    // IO通信占比
+    double readOverheadPct;
+    double writeOverheadPct;
+};
+
+int mainno()
+{
+    constexpr int TEST_COUNT = 1200000;
+    constexpr int ROUND_COUNT = 12;
+
+    pid_t selfPid = getpid();
+    dr.SetGlobalPid(selfPid);
+
+    std::println(stdout, "================================================================");
+    std::println(stdout, "  驱动读写性能基准测试 (连续 {} 轮, 每轮 {} 次操作)", ROUND_COUNT, TEST_COUNT);
+    std::println(stdout, "================================================================");
+    std::println(stdout, "目标PID: {} (自身进程)", selfPid);
+    std::println(stdout, "================================================================\n");
+
+    // 测试变量
+    volatile uint64_t testVar = 0xDEADBEEFCAFEBABE;
+    uint64_t testAddr = reinterpret_cast<uint64_t>(&testVar);
+
+    std::array<RoundResult, ROUND_COUNT> results{};
+
+    // ================================================================
+    // 连续执行 12 轮测试
+    // ================================================================
+    for (int round = 0; round < ROUND_COUNT; ++round)
+    {
+        RoundResult &r = results[round];
+
+        std::println(stdout, "──────────────────────────────────────────");
+        std::println(stdout, "  第 {:>2}/{} 轮测试", round + 1, ROUND_COUNT);
+        std::println(stdout, "──────────────────────────────────────────");
+
+        // ======== 空IO测试 ========
+        {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < TEST_COUNT; ++i)
+            {
+                dr.NullIo();
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+
+            r.nullIoTotalMs = ns / 1e6;
+            r.nullIoAvgNs = static_cast<double>(ns) / TEST_COUNT;
+            r.nullIoThroughputK = (TEST_COUNT / (ns / 1e9)) / 1000.0;
+        }
+
+        // ======== 读取测试 ========
+        {
+            testVar = 0xDEADBEEFCAFEBABE; // 重置
+            uint64_t readResult = 0;
+            r.readFailCount = 0;
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < TEST_COUNT; ++i)
+            {
+                readResult = dr.Read<uint64_t>(testAddr);
+                if (readResult != 0xDEADBEEFCAFEBABE)
+                    r.readFailCount++;
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+
+            double totalS = ns / 1e9;
+            r.readTotalMs = ns / 1e6;
+            r.readAvgNs = static_cast<double>(ns) / TEST_COUNT;
+            r.readNetAvgNs = r.readAvgNs - r.nullIoAvgNs;
+            r.readThroughputK = (TEST_COUNT / totalS) / 1000.0;
+            r.readBandwidthMB = (TEST_COUNT * 8.0) / totalS / (1024.0 * 1024.0);
+        }
+
+        // ======== 写入测试 ========
+        {
+            r.writeFailCount = 0;
+
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (int i = 0; i < TEST_COUNT; ++i)
+            {
+                uint64_t wv = 0x1000000000000000ULL + static_cast<uint64_t>(i);
+                bool ok = dr.Write<uint64_t>(testAddr, wv);
+                if (!ok)
+                    r.writeFailCount++;
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+
+            double totalS = ns / 1e9;
+            r.writeTotalMs = ns / 1e6;
+            r.writeAvgNs = static_cast<double>(ns) / TEST_COUNT;
+            r.writeNetAvgNs = r.writeAvgNs - r.nullIoAvgNs;
+            r.writeThroughputK = (TEST_COUNT / totalS) / 1000.0;
+            r.writeBandwidthMB = (TEST_COUNT * 8.0) / totalS / (1024.0 * 1024.0);
+        }
+
+        // 通信占比
+        r.readOverheadPct = (r.nullIoAvgNs / r.readAvgNs) * 100.0;
+        r.writeOverheadPct = (r.nullIoAvgNs / r.writeAvgNs) * 100.0;
+
+        // 写入数据校验
+        uint64_t verifyVal = dr.Read<uint64_t>(testAddr);
+        uint64_t expectedLast = 0x1000000000000000ULL + static_cast<uint64_t>(TEST_COUNT - 1);
+
+        std::println(stdout, "  空IO:  总 {:>10.3f}ms  均 {:>8.2f}ns  吞吐 {:>8.2f}K/s",
+                     r.nullIoTotalMs, r.nullIoAvgNs, r.nullIoThroughputK);
+        std::println(stdout, "  读取:  总 {:>10.3f}ms  均 {:>8.2f}ns  净 {:>8.2f}ns  吞吐 {:>8.2f}K/s  带宽 {:>6.2f}MB/s  失败 {}",
+                     r.readTotalMs, r.readAvgNs, r.readNetAvgNs, r.readThroughputK, r.readBandwidthMB, r.readFailCount);
+        std::println(stdout, "  写入:  总 {:>10.3f}ms  均 {:>8.2f}ns  净 {:>8.2f}ns  吞吐 {:>8.2f}K/s  带宽 {:>6.2f}MB/s  失败 {}",
+                     r.writeTotalMs, r.writeAvgNs, r.writeNetAvgNs, r.writeThroughputK, r.writeBandwidthMB, r.writeFailCount);
+        std::println(stdout, "  校验:  0x{:016X} {} 0x{:016X} {}",
+                     verifyVal, verifyVal == expectedLast ? "==" : "!=", expectedLast,
+                     verifyVal == expectedLast ? "✓" : "✗");
+        std::println(stdout, "");
+    }
+
+    // ================================================================
+    // 计算 12 轮平均值
+    // ================================================================
+    RoundResult avg{};
+    int totalReadFail = 0, totalWriteFail = 0;
+
+    for (int i = 0; i < ROUND_COUNT; ++i)
+    {
+        const auto &r = results[i];
+        avg.nullIoTotalMs += r.nullIoTotalMs;
+        avg.nullIoAvgNs += r.nullIoAvgNs;
+        avg.nullIoThroughputK += r.nullIoThroughputK;
+
+        avg.readTotalMs += r.readTotalMs;
+        avg.readAvgNs += r.readAvgNs;
+        avg.readNetAvgNs += r.readNetAvgNs;
+        avg.readThroughputK += r.readThroughputK;
+        avg.readBandwidthMB += r.readBandwidthMB;
+        totalReadFail += r.readFailCount;
+
+        avg.writeTotalMs += r.writeTotalMs;
+        avg.writeAvgNs += r.writeAvgNs;
+        avg.writeNetAvgNs += r.writeNetAvgNs;
+        avg.writeThroughputK += r.writeThroughputK;
+        avg.writeBandwidthMB += r.writeBandwidthMB;
+        totalWriteFail += r.writeFailCount;
+
+        avg.readOverheadPct += r.readOverheadPct;
+        avg.writeOverheadPct += r.writeOverheadPct;
+    }
+
+    avg.nullIoTotalMs /= ROUND_COUNT;
+    avg.nullIoAvgNs /= ROUND_COUNT;
+    avg.nullIoThroughputK /= ROUND_COUNT;
+
+    avg.readTotalMs /= ROUND_COUNT;
+    avg.readAvgNs /= ROUND_COUNT;
+    avg.readNetAvgNs /= ROUND_COUNT;
+    avg.readThroughputK /= ROUND_COUNT;
+    avg.readBandwidthMB /= ROUND_COUNT;
+
+    avg.writeTotalMs /= ROUND_COUNT;
+    avg.writeAvgNs /= ROUND_COUNT;
+    avg.writeNetAvgNs /= ROUND_COUNT;
+    avg.writeThroughputK /= ROUND_COUNT;
+    avg.writeBandwidthMB /= ROUND_COUNT;
+
+    avg.readOverheadPct /= ROUND_COUNT;
+    avg.writeOverheadPct /= ROUND_COUNT;
+
+    // ================================================================
+    // 计算标准差 (衡量稳定性)
+    // ================================================================
+    double nullIoAvgNsStd = 0, readAvgNsStd = 0, writeAvgNsStd = 0;
+    for (int i = 0; i < ROUND_COUNT; ++i)
+    {
+        nullIoAvgNsStd += (results[i].nullIoAvgNs - avg.nullIoAvgNs) * (results[i].nullIoAvgNs - avg.nullIoAvgNs);
+        readAvgNsStd += (results[i].readAvgNs - avg.readAvgNs) * (results[i].readAvgNs - avg.readAvgNs);
+        writeAvgNsStd += (results[i].writeAvgNs - avg.writeAvgNs) * (results[i].writeAvgNs - avg.writeAvgNs);
+    }
+    nullIoAvgNsStd = std::sqrt(nullIoAvgNsStd / ROUND_COUNT);
+    readAvgNsStd = std::sqrt(readAvgNsStd / ROUND_COUNT);
+    writeAvgNsStd = std::sqrt(writeAvgNsStd / ROUND_COUNT);
+
+    // ================================================================
+    // 找出最快和最慢轮次
+    // ================================================================
+    int fastestRead = 0, slowestRead = 0;
+    int fastestWrite = 0, slowestWrite = 0;
+    int fastestNullIo = 0, slowestNullIo = 0;
+
+    for (int i = 1; i < ROUND_COUNT; ++i)
+    {
+        if (results[i].nullIoAvgNs < results[fastestNullIo].nullIoAvgNs)
+            fastestNullIo = i;
+        if (results[i].nullIoAvgNs > results[slowestNullIo].nullIoAvgNs)
+            slowestNullIo = i;
+        if (results[i].readAvgNs < results[fastestRead].readAvgNs)
+            fastestRead = i;
+        if (results[i].readAvgNs > results[slowestRead].readAvgNs)
+            slowestRead = i;
+        if (results[i].writeAvgNs < results[fastestWrite].writeAvgNs)
+            fastestWrite = i;
+        if (results[i].writeAvgNs > results[slowestWrite].writeAvgNs)
+            slowestWrite = i;
+    }
+
+    // ================================================================
+    // 输出综合汇总
+    // ================================================================
+    std::println(stdout, "================================================================");
+    std::println(stdout, "  {} 轮测试综合汇总 (每轮 {} 次, 共 {} 次操作)",
+                 ROUND_COUNT, TEST_COUNT, static_cast<long long>(ROUND_COUNT) * TEST_COUNT);
+    std::println(stdout, "================================================================");
+
+    // 每轮详细表格
+    std::println(stdout, "\n┌──────┬────────────────────────┬────────────────────────┬────────────────────────┐");
+    std::println(stdout, "│ 轮次 │     空IO 均耗(ns)      │     读取 均耗(ns)      │     写入 均耗(ns)      │");
+    std::println(stdout, "├──────┼────────────────────────┼────────────────────────┼────────────────────────┤");
+    for (int i = 0; i < ROUND_COUNT; ++i)
+    {
+        std::println(stdout, "│  {:>2}  │ {:>20.2f}  │ {:>20.2f}  │ {:>20.2f}  │",
+                     i + 1,
+                     results[i].nullIoAvgNs,
+                     results[i].readAvgNs,
+                     results[i].writeAvgNs);
+    }
+    std::println(stdout, "├──────┼────────────────────────┼────────────────────────┼────────────────────────┤");
+    std::println(stdout, "│ 平均 │ {:>20.2f}  │ {:>20.2f}  │ {:>20.2f}  │",
+                 avg.nullIoAvgNs, avg.readAvgNs, avg.writeAvgNs);
+    std::println(stdout, "│ 标差 │ {:>20.2f}  │ {:>20.2f}  │ {:>20.2f}  │",
+                 nullIoAvgNsStd, readAvgNsStd, writeAvgNsStd);
+    std::println(stdout, "└──────┴────────────────────────┴────────────────────────┴────────────────────────┘");
+
+    // 平均指标汇总
+    std::println(stdout, "\n╔══════════════════════════════════════════════════════════════╗");
+    std::println(stdout, "║                    平均指标汇总                              ║");
+    std::println(stdout, "╠════════════╦══════════════╦══════════════╦══════════════════╣");
+    std::println(stdout, "║    项目    ║ 总耗时(ms)   ║ 单次均(ns)   ║  吞吐(K ops/s)   ║");
+    std::println(stdout, "╠════════════╬══════════════╬══════════════╬══════════════════╣");
+    std::println(stdout, "║  空IO      ║ {:>12.3f} ║ {:>12.2f} ║ {:>16.2f} ║",
+                 avg.nullIoTotalMs, avg.nullIoAvgNs, avg.nullIoThroughputK);
+    std::println(stdout, "║  读取      ║ {:>12.3f} ║ {:>12.2f} ║ {:>16.2f} ║",
+                 avg.readTotalMs, avg.readAvgNs, avg.readThroughputK);
+    std::println(stdout, "║  写入      ║ {:>12.3f} ║ {:>12.2f} ║ {:>16.2f} ║",
+                 avg.writeTotalMs, avg.writeAvgNs, avg.writeThroughputK);
+    std::println(stdout, "╚════════════╩══════════════╩══════════════╩══════════════════╝");
+
+    std::println(stdout, "\n╔══════════════════════════════════════════════════════════════╗");
+    std::println(stdout, "║                    纯操作耗时 (去除空IO)                     ║");
+    std::println(stdout, "╠════════════╦══════════════╦══════════════════════════════════╣");
+    std::println(stdout, "║    项目    ║  净均耗(ns)  ║            说明                  ║");
+    std::println(stdout, "╠════════════╬══════════════╬══════════════════════════════════╣");
+    std::println(stdout, "║  读取      ║ {:>12.2f} ║ 纯内核读取内存操作耗时           ║", avg.readNetAvgNs);
+    std::println(stdout, "║  写入      ║ {:>12.2f} ║ 纯内核写入内存操作耗时           ║", avg.writeNetAvgNs);
+    std::println(stdout, "╚════════════╩══════════════╩══════════════════════════════════╝");
+
+    std::println(stdout, "\n  数据带宽:");
+    std::println(stdout, "    读取平均带宽: {:.2f} MB/s", avg.readBandwidthMB);
+    std::println(stdout, "    写入平均带宽: {:.2f} MB/s", avg.writeBandwidthMB);
+
+    std::println(stdout, "\n  IO通信开销占比:");
+    std::println(stdout, "    读取中通信占比: {:.2f}%", avg.readOverheadPct);
+    std::println(stdout, "    写入中通信占比: {:.2f}%", avg.writeOverheadPct);
+
+    std::println(stdout, "\n  稳定性 (标准差越小越稳定):");
+    std::println(stdout, "    空IO: ±{:.2f} ns", nullIoAvgNsStd);
+    std::println(stdout, "    读取: ±{:.2f} ns", readAvgNsStd);
+    std::println(stdout, "    写入: ±{:.2f} ns", writeAvgNsStd);
+
+    std::println(stdout, "\n  极值统计:");
+    std::println(stdout, "    空IO: 最快 第{}轮 {:.2f}ns  最慢 第{}轮 {:.2f}ns  波动 {:.2f}ns",
+                 fastestNullIo + 1, results[fastestNullIo].nullIoAvgNs,
+                 slowestNullIo + 1, results[slowestNullIo].nullIoAvgNs,
+                 results[slowestNullIo].nullIoAvgNs - results[fastestNullIo].nullIoAvgNs);
+    std::println(stdout, "    读取: 最快 第{}轮 {:.2f}ns  最慢 第{}轮 {:.2f}ns  波动 {:.2f}ns",
+                 fastestRead + 1, results[fastestRead].readAvgNs,
+                 slowestRead + 1, results[slowestRead].readAvgNs,
+                 results[slowestRead].readAvgNs - results[fastestRead].readAvgNs);
+    std::println(stdout, "    写入: 最快 第{}轮 {:.2f}ns  最慢 第{}轮 {:.2f}ns  波动 {:.2f}ns",
+                 fastestWrite + 1, results[fastestWrite].writeAvgNs,
+                 slowestWrite + 1, results[slowestWrite].writeAvgNs,
+                 results[slowestWrite].writeAvgNs - results[fastestWrite].writeAvgNs);
+
+    std::println(stdout, "\n  累计失败统计:");
+    std::println(stdout, "    读取总失败: {} / {} ({:.6f}%)",
+                 totalReadFail, static_cast<long long>(ROUND_COUNT) * TEST_COUNT,
+                 totalReadFail * 100.0 / (static_cast<double>(ROUND_COUNT) * TEST_COUNT));
+    std::println(stdout, "    写入总失败: {} / {} ({:.6f}%)",
+                 totalWriteFail, static_cast<long long>(ROUND_COUNT) * TEST_COUNT,
+                 totalWriteFail * 100.0 / (static_cast<double>(ROUND_COUNT) * TEST_COUNT));
+
+    std::println(stdout, "\n================================================================");
+    std::println(stdout, "  全部 {} 轮测试完成", ROUND_COUNT);
+    std::println(stdout, "================================================================");
 
     return 0;
 }

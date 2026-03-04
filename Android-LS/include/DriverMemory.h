@@ -606,20 +606,29 @@ public: // 外部硬件断点接口
         SCOPE_ALL_THREADS    // 全部线程
     };
 
-    // 存储命中信息
+    // 记录单个 PC（触发指令地址）的命中状态
+    struct hwbp_record
+    {
+        uint64_t pc;        // 触发断点的汇编指令地址
+        uint64_t hit_count; // 该 PC 命中的次数
+        uint64_t regs[30];  // 最新的 X0 ~ X29 寄存器
+        uint64_t lr;        // X30
+        uint64_t sp;        // Stack Pointer
+        uint64_t orig_x0;   // 原始 X0
+        uint64_t syscallno; // 系统调用号
+        uint64_t pstate;    // 处理器状态
+    };
+
+    // 存储整体命中信息
     struct hwbp_info
     {
-        uint64_t num_brps;  // 执行断点的数量
-        uint64_t num_wrps;  // 访问断点的数量
-        uint64_t hit_addr;  // 监控地址
-        uint64_t hit_count; // 命中次数
-        uint64_t regs[30];  // X0 ~ X29 寄存器
-        uint64_t lr;        // X30 (Link Register)
-        uint64_t sp;        // Stack Pointer
-        uint64_t pc;        // 触发断点的汇编指令地址
-        uint64_t orig_x0;   // 原始 X0 (用于系统调用重启)
-        uint64_t syscallno; // 系统调用号
-        uint64_t pstate;    // 处理器状态 (CPSR/PSTATE)
+        uint64_t num_brps; // 执行断点的数量
+        uint64_t num_wrps; // 访问断点的数量
+        uint64_t hit_addr; // 监控的地址
+
+        // 记录不同 PC 触发状态的数组
+        struct hwbp_record records[0x100];
+        int record_count; // 当前已记录的不同 PC 数量
     };
 
     // 间接调用引用
@@ -635,6 +644,17 @@ public: // 外部硬件断点接口
     void RemoveProcessHwbpRef()
     {
         RemoveProcessHwbp();
+    }
+
+    // 删除指定索引内容
+    void RemoveHwbpRecord(int index)
+    {
+        if (index < 0 || index >= req->bp_info.record_count)
+            return;
+        for (int i = index; i < req->bp_info.record_count - 1; ++i)
+            req->bp_info.records[i] = req->bp_info.records[i + 1];
+        req->bp_info.record_count--;
+        memset(&req->bp_info.records[req->bp_info.record_count], 0, sizeof(hwbp_record));
     }
 
 private: // 私有实现，外部无需关系
