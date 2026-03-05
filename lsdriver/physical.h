@@ -991,23 +991,20 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
 
     /*
      * =========================================================================================
-     * 反作弊 VMA 碎裂与诱饵对抗机制
+     * 反作弊 VMA 碎裂与诱饵对抗机制 (还原完美天然布局版)
      * =========================================================================================
      *
      * 【第一阶段：理想状态下的纯净内存布局 (原生 ELF 加载)】
-     * 当 Linux/Android 原生加载一个 libil2cpp.so 时，它在内存中的排布是非常连续且规律的：
-     * - 头部 (RO): 包含 ELF Header 和 Program Header，也就是真实的基址 (Base Address)。
-     * - 代码 (RX): .text 段，紧跟在头部之后。
-     * - 数据 (RW): .data / .bss 段，跟在代码之后。
-     * 事实上，现代 Android 系统（特别是 LLVM/Clang 编译的 64 位）出于安全考虑，
-     * 原生加载时至少会 4 到 6 个 VMA 碎片，小的so文件就 1 到 2 个VMA：
-     *   1. 头部 (RO): ELF Header 和 .rodata（真实的 Base Address 起点）。
-     *   2. 代码 (RX): .text 段，紧跟头部。
-     *   3. RELRO (RO): 系统安全机制，写完重定位表后强行锁死为只读，凭空多出一个 RO 碎片。
+     * 当 Linux/Android 原生加载一个 libil2cpp.so 时，它在内存中的排布是非常连续且规律的。
+     * 现代 Android 系统（特别是 LLVM/Clang 编译的 64 位）出于安全考虑，
+     * 原生加载时至少会产生 4 到 6 个连续的 VMA 区段（小的 so 文件会有 1 到 2 个）：
+     *   1. 头部 (RO): 包含 ELF Header 和 Program Header，真实的 Base Address 起点。
+     *   2. 代码 (RX): .text 段，紧跟在头部之后。
+     *   3. RELRO (RO): 系统安全机制，写完重定位表后强行锁死为只读，凭空多出第二个 RO 段。
      *   4. 数据 (RW): .data 全局变量段。
      *   5. BSS  (RW): 尾部额外分配的无文件映射的匿名读写内存。
-     * 所以，即使没有反作弊，最纯净的环境也会产生 [RO -> RX -> RO -> RW -> RW] 的轻微碎裂。
-     * 此时驱动收集到的段非常完美：Index 0=RX(代码), Index 1=RO(头基址), Index 2=RW(数据)。
+     * 所以，即使没有反作弊，最纯净的环境也会产生 [RO -> RX -> RO -> RW -> RW] 的天然区段。
+     * 此时驱动收集到的区段严格按照物理内存的先后顺序自然排列。
      *
      * 【第二阶段：反作弊系统的双重伪装攻击】
      * 现代顶级反作弊（如 ACE）为了防止外部读取和内存 Dump，会做两件极其恶心的事情：
@@ -1016,8 +1013,7 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
      *   反作弊为了 Hook 游戏内部函数，会高频调用 mprotect() 修改代码段的权限。
      *   Linux 内核为了管理不同的物理页权限，被迫将原本 1 个巨大的 RX 代码段，
      *   “劈碎”成了几十甚至上百个细碎的 VMA（虚拟内存区域），并且有些页被改成了 RWX 混合权限。
-     *   这导致我们原本排在第 2 位的 RO 段（真实基址），被前面几十个 RX 碎片硬生生挤到了
-     *   Index 8 甚至 Index 9 的位置，导致固定索引偏移失效。
+     *   这导致原本连贯的天然区段被无数个碎片彻底打乱。
      *
      *   攻击手段 2：远端假诱饵
      *   反作弊会在距离真实模块上百 MB 远的极低地址（例如 0x6e32250000），
@@ -1025,12 +1021,12 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
      *   如果我们使用常规的合并算法，会误把这个极远的假地址当成模块的起始地址，
      *   从而导致算出的 Base Address 完全错误（偏离真实基址几十上百MB），读取指针全部失效。
      *
-     * 【第三阶段：我们的对抗算法】
-     * 为了获取绝对精准的真实基址 (Real Base)，我们采用“物理聚类 + 碎片缝合”的降维打击算法：
+     * 【第三阶段：我们的对抗算法 (物理聚类 + 拉链式精准缝合)】
+     * 为了获取绝对精准的真实基址 (Real Base) 并完美还原天然布局，我们采用以下降维打击：
      *
      *   步骤 1：物理排序与聚类 (寻找生命主干)
-     *   无视所有的权限标签，直接把所有叫 libil2cpp.so 的内存块按物理地址 (start) 升序排列。
-     *   由于 ARM64 架构指令寻址的限制，真实的 .so 内存必须紧凑地挨在一起。
+     *   无视所有的权限标签，直接把所有同名的内存块按物理地址 (start) 升序排列。
+     *   =========>>>>>>>由于 ARM64 架构指令寻址的限制，真实的 .so 内存必须紧凑地挨在一起。
      *   我们遍历这些内存块，一旦发现两个块之间的“缝隙”超过 16MB (0x1000000 阈值)，
      *   就意味着碰到了“内存断层”。此时立刻判定：那个孤零零在远处的内存绝对是反作弊的假诱饵！
      *
@@ -1038,29 +1034,33 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
      *   算出体积最大的连续内存群落（即真正的 .so 主体），把不在这个范围内的假诱饵（碎片）
      *   从数组中彻底剔除、物理抹杀。
      *
-     *   步骤 3：包围盒缝合
-     *   将剩下的纯净真碎片，重新按照 RX -> RO -> RW 排序。
-     *   针对被反作弊劈碎的同类型碎片，使用“包围盒算法”：取这些碎片的最小 start 和最大 end，
-     *   =>>>这一步不仅缝合了被反作弊劈碎的几十个 RX 碎片，同时也顺手把 Android 系统原生的
-     *   “头部 RO”和“RELRO RO”抹平，强行揉成了一个巨大的、完美的虚拟段！
+     *   步骤 3：拉链式精准缝合 (还原原生边界)
+     *   剔除诱饵后，【严禁】按权限类型重新排序，必须保持物理内存的天然升序排列！
+     *   遍历剩余碎片，只有当相邻两个碎片【首尾绝对相连 (prev->end == curr->start)】
+     *   并且【属于同一种初始映射类型 (prev->index == curr->index)】时，
+     *   才判定它们是被 mprotect 恶意劈碎的同一块区域，并进行无缝拉链式融合。
+     *   一旦遇到天然的段边界（例如从 头部RO 走到了 代码RX），哪怕首尾相连也停止缝合，作为独立区段保留。
      *
      * 【最终战果】：
-     * 无论反作弊怎么切分、怎么放诱饵，跑完此算法后，产出的结果永远绝对固定：
-     * - 数组 Index 0：必定是缝合后的 RX 完整代码段。
-     * - 数组 Index 1：必定是剔除诱饵后的 RO 完整头数据，它的 start【绝对等于】dladdr 获取的真实基址！
-     * - 数组 Index 2：必定是缝合后的 RW 完整数据段。
+     * 无论反作弊怎么切分代码段、怎么乱放假基址诱饵，跑完此算法后，
+     * 产出的结果与一台干净没开游戏的手机上看到的原生 ELF 映射 1:1 完全一致！
+     * 对于典型游戏引擎模块，它会完美恢复成 4~7 个自然段：
+     * - 数组 Index 0：必定是缝合后的 [头部 RO]，它的 start 【绝对等于】真实的 Base Address！
+     * - 数组 Index 1：必定是缝合了上百个 mprotect 碎片后的完整 [代码 RX] 段！
+     * - 数组 Index 2：必定是系统天然保留的 [数据 RO] (RELRO 段)。
+     * - 数组 Index 3/4：必定是 [数据 RW] / [匿名 RW]。
      *
-     * 外部辅助只需无脑调用：Read(段1_Start + Golden_RVA)，即可
+     * 外部辅助只需无脑调用：Base = info->modules[X].segs[0].start，即可获取绝对真实的基址！
      * =========================================================================================
      */
+
     for (i = 0; i < info->module_count; i++)
     {
         struct module_info *m = &info->modules[i];
 
         if (m->seg_count > 0)
         {
-            // 纯物理地址排序，寻找真实的模块主干
-            // 使用冒泡排序按 start 升序排列 (暂时无视 RX/RO 权限)
+            // 纯物理地址排序
             for (int x = 0; x < m->seg_count - 1; x++)
             {
                 for (int y = x + 1; y < m->seg_count; y++)
@@ -1074,8 +1074,8 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
                 }
             }
 
-            // 聚类算法，找出真实的内存块，标记假诱饵
-            // 真实模块的各个段缝隙很小，假诱饵 (如 0x6e32...) 离得极远 (>16MB)
+            // 聚类算法，寻找真实的模块主干
+            //  真实模块的各个段缝隙很小，假诱饵离得极远 (>16MB)
             uint64_t temp_base = m->segs[0].start;
             uint64_t temp_end = m->segs[0].end;
             uint64_t max_chunk_size = 0;
@@ -1084,8 +1084,9 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
 
             for (j = 1; j < m->seg_count; j++)
             {
+                // 跨度超过16MB，判定为内存断层
                 if (m->segs[j].start - temp_end > 0x1000000)
-                { // 跨度超过16MB，判定为断层
+                {
                     uint64_t chunk_size = temp_end - temp_base;
                     if (chunk_size > max_chunk_size)
                     {
@@ -1108,58 +1109,56 @@ static int enum_process_memory(pid_t pid, struct memory_info *info)
                 best_end = temp_end;
             }
 
-            // 物理清洗，直接剔除诱饵碎片
+            // 物理清洗，彻底抹杀假诱饵
             int valid_count = 0;
             for (j = 0; j < m->seg_count; j++)
             {
-                // 只有处于“真实主干”范围内的段才保留，彻底抹杀 0x6e32...
+                // 只有处于“真实主干”范围内的段才保留，剔除 0x6e32... 等假地址
                 if (m->segs[j].start >= best_base && m->segs[j].end <= best_end)
                 {
                     m->segs[valid_count++] = m->segs[j];
                 }
             }
-            m->seg_count = valid_count; // 更新为清洗后的纯净数量
+            m->seg_count = valid_count;
 
-            // 恢复你原本的类型排序 (RX=0 -> RO=1 -> RW=2)
-            if (m->seg_count > 1)
-            {
-                sort(m->segs, m->seg_count, sizeof(struct segment_info), cmp_seg, NULL);
-            }
-
-            // 包围盒算法，缝合同类型碎片
+            // 拉链式碎片缝合
             int out_idx = 0;
             for (j = 1; j < m->seg_count; j++)
             {
                 struct segment_info *prev = &m->segs[out_idx];
                 struct segment_info *curr = &m->segs[j];
 
-                if (prev->index == curr->index)
+                /*
+                 * 缝合判定条件（必须同时满足）：
+                 * 1. prev->end == curr->start : 内存首尾绝对相接，中间没有一丝缝隙。
+                 * 2. prev->index == curr->index : 属于同一种原生映射类型 (例如最初都被判定为 RX)。
+                 *
+                 * 满足这两个条件，说明这绝对是被反作弊 mprotect 劈碎的同一个天然区段。
+                 */
+                if (prev->end == curr->start && prev->index == curr->index)
                 {
-                    // 同类型的内存碎片，合并边界
-                    if (curr->end > prev->end)
-                        prev->end = curr->end;
+                    // 完美缝合：延伸尾部边界，并融合可能被篡改的混合权限位
+                    prev->end = curr->end;
                     prev->prot |= curr->prot;
                 }
                 else
                 {
+                    // 遇到了天然的段边界（如 RO 走到 RX，或内存不连续）
+                    // 停止缝合，将其作为独立的天然区段保留下来
                     out_idx++;
                     m->segs[out_idx] = *curr;
                 }
             }
             m->seg_count = out_idx + 1;
 
-            // 重新打上 0, 1, 2 的索引编号
-            seq = 0;
+            // 按物理内存排布重新分配天然 Index
+            //  此时模块已经恢复成纯净的 4~7 个自然段，直接按先后顺序编号即可
             for (j = 0; j < m->seg_count; j++)
             {
-                if (m->segs[j].index != -1)
-                {
-                    m->segs[j].index = seq++;
-                }
+                m->segs[j].index = j;
             }
         }
     }
-
     mmput(mm);
     put_task_struct(task);
     kfree(path_buf);

@@ -263,7 +263,7 @@ namespace MemUtils
     // 去除MTE指针标签0xb40000
     constexpr uintptr_t Normalize(uintptr_t addr) noexcept
     {
-        return addr & 0xFFFFFFFFFFFFULL;
+        return addr & ~(0xFFULL << 56);
     }
 
     // 验证地址合法性，指针和地址才需要验证，值不需要
@@ -1008,7 +1008,18 @@ private:
     {
         std::unordered_set<PtrData *> matched;
         const auto &info = dr.GetMemoryInfoRef();
-
+        std::println("当前进程模块数量: {}", info.module_count);
+        if (info.module_count == 0)
+        {
+            std::println(stderr, "警告: 未获取到任何模块，扫描将无法找到基址！");
+        }
+        else
+        {
+            for (int i = 0; i < std::min(5, info.module_count); i++)
+            {
+                std::println("模块[{}]: {} (0x{:x} - 0x{:x})", i, info.modules[i].name, info.modules[i].segs[0].start, info.modules[i].segs[0].end);
+            }
+        }
         for (int mi = 0; mi < info.module_count; ++mi)
         {
             const auto &mod = info.modules[mi];
@@ -2227,7 +2238,7 @@ private:
 };
 
 // ============================================================================
-// UI 构建器 
+// UI 构建器
 // ============================================================================
 class UIStyle
 {

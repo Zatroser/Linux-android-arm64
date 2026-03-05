@@ -781,13 +781,13 @@ private: // 私有实现，外部无需关系
     }
     void ExitCommunication()
     {
-        // 内核停止运行
-        req->op = kexit;
-        IoCommitAndWait();
-
-        // // 普通断开
-        // req->op = exit;
+        // //内核停止运行
+        // req->op = kexit;
         // IoCommitAndWait();
+
+        // 普通断开
+        req->op = exit;
+        IoCommitAndWait();
     }
     // 初始化触摸连接断开
     void InitTouch()
