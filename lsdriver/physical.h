@@ -412,21 +412,28 @@ static inline int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_add
     pgd_phys = virt_to_phys(mm->pgd);
 
     asm volatile(
-        // 保存当前中断状态并关中断
+        //  保存当前中断状态并关中断，防止抢占
         "mrs    %[tmp_daif], daif\n"
         "msr    daifset, #2\n"
 
-        // 临时把 ttbr0_el1 改为pgd_phys，为了后续at指令翻译需要的页表基址
+        // // 临时把 ttbr0_el1 改为pgd_phys，为了后续at指令翻译需要的页表基址 (此时 ASID 为 0)
         "mrs    %[tmp_ttbr], ttbr0_el1\n"
         "msr    ttbr0_el1, %[pgd_phys]\n"
         "isb\n"
 
-        // 硬件翻译指令
+        //  硬件翻译指令
         "at     s1e0r, %[va]\n"
         "isb\n"
         "mrs    %[tmp_par], par_el1\n"
 
-        // 恢复页表和中断
+        // 清除 ASID 0 的 TLB 污染！
+        // 因为刚刚的 at 指令可能会将 ASID=0 的翻译结果缓存进 TLB
+        // 如果不清理，会导致系统关键进程命中错误的 TLB 从而引发软重启
+        "lsr    %[tmp_offset], %[va], #12\n" // 右移 12 位，构造 TLBI 需要的 VPN 格式
+        "tlbi   vale1, %[tmp_offset]\n"      // 使当前 CPU 的该 VA (ASID=0) 的 TLB 失效
+        "dsb    nsh\n"                       // 确保本地 TLB 清理完成
+
+        // 恢复原来的页表和中断
         "msr    ttbr0_el1, %[tmp_ttbr]\n"
         "isb\n"
         "msr    daif, %[tmp_daif]\n"
@@ -434,7 +441,7 @@ static inline int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_add
         // 检查翻译是否报错 (PAR_EL1 的 bit 0)
         "tbnz   %[tmp_par], #0, .L_efault%=\n"
 
-        // 计算物理地址 (直接使用内联的逻辑立即数)
+        // 计算物理地址
         "and    %[tmp_par], %[tmp_par], #0xFFFFFFFFF000\n"
         "and    %[tmp_offset], %[va], #0xFFF\n"
         "orr    %[phys_out], %[tmp_par], %[tmp_offset]\n"
@@ -449,7 +456,7 @@ static inline int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_add
 
         ".L_end%=:\n"
 
-        // 输出部分 (注意: 必须使用 =&r 早期破坏符，防止编译器将输入分配到同一个寄存器)
+        // 输出部分
         : [ret] "=&r"(ret),
           [phys_out] "=&r"(phys_out),
           [tmp_daif] "=&r"(tmp_daif),
@@ -464,7 +471,6 @@ static inline int translate_user_va_to_pa(struct mm_struct *mm, u64 va, phys_add
 
         // Clobber
         : "cc", "memory");
-
     // 把写入内存的工作交回给 C 语言，编译器会生成最优的指令
     if (ret == 0)
     {
