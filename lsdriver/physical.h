@@ -187,54 +187,61 @@ static inline int pte_read_physical(phys_addr_t paddr, void *buffer, size_t size
 {
     void *mapped = pte_map_page(paddr, size, buffer);
     if (IS_ERR(mapped))
+    {
         return PTR_ERR(mapped);
+    }
 
+    // 极限性能且安全的内存拷贝 (防未对齐崩溃)
     switch (size)
     {
     case 1:
-        *(uint8_t *)buffer = READ_ONCE(*(uint8_t *)mapped);
+        __builtin_memcpy(buffer, mapped, 1);
         break;
     case 2:
-        *(uint16_t *)buffer = READ_ONCE(*(uint16_t *)mapped);
+        __builtin_memcpy(buffer, mapped, 2);
         break;
     case 4:
-        *(uint32_t *)buffer = READ_ONCE(*(uint32_t *)mapped);
+        __builtin_memcpy(buffer, mapped, 4);
         break;
     case 8:
-        *(uint64_t *)buffer = READ_ONCE(*(uint64_t *)mapped);
+        __builtin_memcpy(buffer, mapped, 8);
         break;
     default:
-        memcpy(buffer, mapped, size);
+        __builtin_memcpy(buffer, mapped, size);
         break;
     }
+
     return 0;
 }
 
 // 写入
 static inline int pte_write_physical(phys_addr_t paddr, const void *buffer, size_t size)
 {
-    void *mapped = pte_map_page(paddr, size, buffer);
+    void *mapped = pte_map_page(paddr, size, (void *)buffer);
     if (IS_ERR(mapped))
+    {
         return PTR_ERR(mapped);
+    }
 
     switch (size)
     {
     case 1:
-        WRITE_ONCE(*(uint8_t *)mapped, *(const uint8_t *)buffer);
+        __builtin_memcpy(mapped, buffer, 1);
         break;
     case 2:
-        WRITE_ONCE(*(uint16_t *)mapped, *(const uint16_t *)buffer);
+        __builtin_memcpy(mapped, buffer, 2);
         break;
     case 4:
-        WRITE_ONCE(*(uint32_t *)mapped, *(const uint32_t *)buffer);
+        __builtin_memcpy(mapped, buffer, 4);
         break;
     case 8:
-        WRITE_ONCE(*(uint64_t *)mapped, *(const uint64_t *)buffer);
+        __builtin_memcpy(mapped, buffer, 8);
         break;
     default:
-        memcpy(mapped, buffer, size);
+        __builtin_memcpy(mapped, buffer, size);
         break;
     }
+
     return 0;
 }
 
@@ -319,61 +326,72 @@ static inline int mmu_translate_va_to_pa(struct mm_struct *mm, u64 va, phys_addr
 
 //============方案2:(建议使用,顶部有说原因)内核已经映射的线性地址读写+手动走页表翻译地址============
 
-// 读取
 static inline int linear_read_physical(phys_addr_t paddr, void *buffer, size_t size)
 {
-    // 直接数学转换 在 ARM64 上，这通常等价于: (void*)(paddr + PAGE_OFFSET)
     void *kernel_vaddr = phys_to_virt(paddr);
-    /*
-    这里去掉了 virt_addr_valid。在 ARM64 上，它由于要遍历内存节点，耗极高。
-    在查页表时统一拦截：把安全校验提前到了翻译阶段，
-    只要返回物理地址就是合理有效的
-    */
 
+    // 最后的安全底线：防算错物理地址/内存空洞导致死机
+    if (unlikely(!virt_addr_valid(kernel_vaddr)))
+    {
+        return -EFAULT;
+    }
+
+    // 极限性能且安全的内存拷贝 (防未对齐崩溃)
     switch (size)
     {
     case 1:
-        *(uint8_t *)buffer = READ_ONCE(*(uint8_t *)kernel_vaddr);
+        __builtin_memcpy(buffer, kernel_vaddr, 1);
         break;
     case 2:
-        *(uint16_t *)buffer = READ_ONCE(*(uint16_t *)kernel_vaddr);
+        __builtin_memcpy(buffer, kernel_vaddr, 2);
         break;
     case 4:
-        *(uint32_t *)buffer = READ_ONCE(*(uint32_t *)kernel_vaddr);
+        __builtin_memcpy(buffer, kernel_vaddr, 4);
         break;
     case 8:
-        *(uint64_t *)buffer = READ_ONCE(*(uint64_t *)kernel_vaddr);
+        __builtin_memcpy(buffer, kernel_vaddr, 8);
         break;
     default:
-        memcpy(buffer, kernel_vaddr, size);
+        __builtin_memcpy(buffer, kernel_vaddr, size);
         break;
     }
+
     return 0;
 }
+
 // 写入
 static inline int linear_write_physical(phys_addr_t paddr, void *buffer, size_t size)
 {
     void *kernel_vaddr = phys_to_virt(paddr);
+
+    if (unlikely(!virt_addr_valid(kernel_vaddr)))
+    {
+        return -EFAULT;
+    }
+
+    // 极限性能且安全的内存拷贝 (防未对齐崩溃)
     switch (size)
     {
     case 1:
-        WRITE_ONCE(*(uint8_t *)kernel_vaddr, *(const uint8_t *)buffer);
+        __builtin_memcpy(kernel_vaddr, buffer, 1);
         break;
     case 2:
-        WRITE_ONCE(*(uint16_t *)kernel_vaddr, *(const uint16_t *)buffer);
+        __builtin_memcpy(kernel_vaddr, buffer, 2);
         break;
     case 4:
-        WRITE_ONCE(*(uint32_t *)kernel_vaddr, *(const uint32_t *)buffer);
+        __builtin_memcpy(kernel_vaddr, buffer, 4);
         break;
     case 8:
-        WRITE_ONCE(*(uint64_t *)kernel_vaddr, *(const uint64_t *)buffer);
+        __builtin_memcpy(kernel_vaddr, buffer, 8);
         break;
     default:
-        memcpy(kernel_vaddr, buffer, size);
+        __builtin_memcpy(kernel_vaddr, buffer, size);
         break;
     }
+
     return 0;
 }
+
 // 手动走页表翻译（不再禁止中断，靠每级安全检查防护）
 static inline int walk_translate_va_to_pa(struct mm_struct *mm, uint64_t vaddr, phys_addr_t *paddr)
 {
@@ -582,7 +600,6 @@ static inline int write_process_memory(pid_t pid, uint64_t vaddr, void *buffer, 
 {
     return _process_memory_rw(op_w, pid, vaddr, buffer, size);
 }
-
 
 /*
  maps 文件

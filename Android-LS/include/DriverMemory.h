@@ -99,30 +99,54 @@ public:                // 外部初始化
     }
 
 public: // 共有结构体和锁
-    // 轻量高性能自旋锁
+        // 轻量高性能自旋锁
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__i386__) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
     class SpinLock
     {
         std::atomic_flag locked = ATOMIC_FLAG_INIT;
 
-    public:
-        void lock()
+        inline void pause() const noexcept
         {
-            // 尝试加锁，如果失败则一直循环
+#if defined(_MSC_VER)
+            _mm_pause();
+#elif defined(__i386__) || defined(__x86_64__)
+            _mm_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+            __asm__ volatile("yield" ::: "memory");
+#endif
+        }
+
+    public:
+        void lock() noexcept
+        {
+            for (int i = 0; i < 64; ++i)
+            {
+
+                if (!locked.test_and_set(std::memory_order_acquire))
+                {
+                    return;
+                }
+
+                while (locked.test(std::memory_order_relaxed))
+                {
+                    pause();
+                }
+            }
+
             while (locked.test_and_set(std::memory_order_acquire))
             {
-                // 插入 CPU 级的 pause/yield 指令，防止占满流水线并降低功耗
-#if defined(__i386__) || defined(__x86_64__)
-                __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-                __asm__ volatile("yield" ::: "memory"); // Android ARM 架构极速暂停
-#else
-                // 什么都不做，或者 std::this_thread::yield() (较慢)
-#endif
+                locked.wait(true, std::memory_order_relaxed);
             }
         }
-        void unlock()
+
+        void unlock() noexcept
         {
             locked.clear(std::memory_order_release);
+            locked.notify_one();
         }
     };
     SpinLock m_mutex;
@@ -803,38 +827,41 @@ private: // 私有实现，外部无需关系
             return req->status;
         }
 
-        //  小数据快速通道
+        // 小数据快速通道
         req->op = op_r;
         req->pid = global_pid;
         req->target_addr = addr;
         req->size = size;
 
         IoCommitAndWait();
+
         // 失败时清空并返回错误码
         if (req->status <= 0)
             return req->status;
 
+        // 极限性能且安全的内存拷贝 (防未对齐崩溃)
         switch (size)
         {
         case 1:
-            *reinterpret_cast<uint8_t *>(buffer) = *reinterpret_cast<uint8_t *>(req->user_buffer);
+            __builtin_memcpy(buffer, req->user_buffer, 1);
             break;
         case 2:
-            *reinterpret_cast<uint16_t *>(buffer) = *reinterpret_cast<uint16_t *>(req->user_buffer);
+            __builtin_memcpy(buffer, req->user_buffer, 2);
             break;
         case 4:
-            *reinterpret_cast<uint32_t *>(buffer) = *reinterpret_cast<uint32_t *>(req->user_buffer);
+            __builtin_memcpy(buffer, req->user_buffer, 4);
             break;
         case 8:
-            *reinterpret_cast<uint64_t *>(buffer) = *reinterpret_cast<uint64_t *>(req->user_buffer);
+            __builtin_memcpy(buffer, req->user_buffer, 8);
             break;
         default:
-            memcpy(buffer, req->user_buffer, size);
+            __builtin_memcpy(buffer, req->user_buffer, size);
             break;
         }
 
         return req->status;
     }
+
     int KWriteProcessMemory(uint64_t addr, void *buffer, size_t size)
     {
         std::scoped_lock<SpinLock> lock(m_mutex);
@@ -860,7 +887,7 @@ private: // 私有实现，外部无需关系
             return req->status;
         }
 
-        //  小数据快速通道
+        // 小数据快速通道
         req->op = op_w;
         req->pid = global_pid;
         req->target_addr = addr;
@@ -869,19 +896,19 @@ private: // 私有实现，外部无需关系
         switch (size)
         {
         case 1:
-            *reinterpret_cast<uint8_t *>(req->user_buffer) = *reinterpret_cast<uint8_t *>(buffer);
+            __builtin_memcpy(req->user_buffer, buffer, 1);
             break;
         case 2:
-            *reinterpret_cast<uint16_t *>(req->user_buffer) = *reinterpret_cast<uint16_t *>(buffer);
+            __builtin_memcpy(req->user_buffer, buffer, 2);
             break;
         case 4:
-            *reinterpret_cast<uint32_t *>(req->user_buffer) = *reinterpret_cast<uint32_t *>(buffer);
+            __builtin_memcpy(req->user_buffer, buffer, 4);
             break;
         case 8:
-            *reinterpret_cast<uint64_t *>(req->user_buffer) = *reinterpret_cast<uint64_t *>(buffer);
+            __builtin_memcpy(req->user_buffer, buffer, 8);
             break;
         default:
-            memcpy(req->user_buffer, buffer, size);
+            __builtin_memcpy(req->user_buffer, buffer, size);
             break;
         }
 
