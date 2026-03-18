@@ -1191,6 +1191,240 @@ public:
 };
 
 // ============================================================================
+// 锁定管理器
+// ============================================================================
+class LockManager
+{
+private:
+    struct LockItem
+    {
+        uintptr_t addr;
+        Types::DataType type;
+        std::string value;
+    };
+    std::list<LockItem> locks_;
+    mutable std::mutex mutex_;
+    std::jthread writeThread_;
+
+    auto find(uintptr_t addr)
+    {
+        return std::ranges::find_if(locks_, [addr](auto &i)
+                                    { return i.addr == addr; });
+    }
+
+    void writeLoop(std::stop_token stoken)
+    {
+        while (!stoken.stop_requested() && Config::g_Running)
+        {
+            {
+                std::lock_guard lock(mutex_);
+                for (auto &item : locks_)
+                    MemUtils::WriteFromString(item.addr, item.type, item.value);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+
+public:
+    LockManager()
+        : writeThread_([this](std::stop_token st)
+                       { writeLoop(st); }) {}
+
+    ~LockManager() { writeThread_.request_stop(); }
+
+    bool isLocked(uintptr_t addr) const
+    {
+        std::lock_guard lock(mutex_);
+        return std::ranges::any_of(locks_, [addr](const auto &i)
+                                   { return i.addr == addr; });
+    }
+
+    void toggle(uintptr_t addr, Types::DataType type)
+    {
+        std::lock_guard lock(mutex_);
+        if (auto it = find(addr); it != locks_.end())
+            locks_.erase(it);
+        else
+            locks_.push_back({addr, type, MemUtils::ReadAsString(addr, type)});
+    }
+
+    void lock(uintptr_t addr, Types::DataType type, const std::string &value)
+    {
+        std::lock_guard lk(mutex_);
+        if (find(addr) == locks_.end())
+            locks_.push_back({addr, type, value});
+    }
+
+    void unlock(uintptr_t addr)
+    {
+        std::lock_guard lk(mutex_);
+        std::erase_if(locks_, [addr](const auto &item)
+                      { return item.addr == addr; });
+    }
+
+    void lockBatch(std::span<const uintptr_t> addrs, Types::DataType type)
+    {
+        std::lock_guard lk(mutex_);
+        for (auto addr : addrs)
+        {
+            if (!std::ranges::any_of(locks_, [addr](const auto &item)
+                                     { return item.addr == addr; }))
+                locks_.emplace_back(addr, type, MemUtils::ReadAsString(addr, type));
+        }
+    }
+
+    void unlockBatch(std::span<const uintptr_t> addrs)
+    {
+        std::lock_guard lk(mutex_);
+        for (auto addr : addrs)
+            std::erase_if(locks_, [addr](const auto &item)
+                          { return item.addr == addr; });
+    }
+
+    void clear()
+    {
+        std::lock_guard lk(mutex_);
+        locks_.clear();
+    }
+};
+
+// ============================================================================
+// 内存浏览器
+// ============================================================================
+class MemViewer
+{
+private:
+    uintptr_t base_ = 0;
+    Types::ViewFormat format_ = Types::ViewFormat::Hex;
+    std::vector<uint8_t> buffer_;
+    bool visible_ = false;
+    bool readSuccess_ = false;
+    Disasm::Disassembler disasm_;
+    std::vector<Disasm::DisasmLine> disasmCache_;
+    int disasmScrollIdx_ = 0;
+
+public:
+    MemViewer() : buffer_(Config::Constants::MEM_VIEW_RANGE * 2) {}
+
+    bool isVisible() const noexcept { return visible_; }
+    void setVisible(bool v) noexcept { visible_ = v; }
+    Types::ViewFormat format() const noexcept { return format_; }
+    bool readSuccess() const noexcept { return readSuccess_; }
+    uintptr_t base() const noexcept { return base_; }
+    const std::vector<uint8_t> &buffer() const noexcept { return buffer_; }
+    const std::vector<Disasm::DisasmLine> &getDisasm() const noexcept { return disasmCache_; }
+    int disasmScrollIdx() const noexcept { return disasmScrollIdx_; }
+
+    void setFormat(Types::ViewFormat fmt)
+    {
+        format_ = fmt;
+        disasmScrollIdx_ = 0;
+        refresh();
+    }
+
+    void open(uintptr_t addr)
+    {
+        if (format_ == Types::ViewFormat::Disasm)
+            addr &= ~static_cast<uintptr_t>(3); // 强制 4 字节对齐
+        base_ = addr;
+        disasmScrollIdx_ = 0;
+        refresh();
+        visible_ = true;
+    }
+
+    void move(int lines, size_t step)
+    {
+        if (format_ == Types::ViewFormat::Disasm)
+        {
+            moveDisasm(lines);
+        }
+        else
+        {
+            int64_t delta = static_cast<int64_t>(lines) * static_cast<int64_t>(step);
+            if (delta < 0 && base_ < static_cast<uintptr_t>(-delta))
+                base_ = 0;
+            else
+                base_ += delta;
+            refresh();
+        }
+    }
+
+    void refresh()
+    {
+        if (base_ > Config::Constants::ADDR_MAX)
+        {
+            readSuccess_ = false;
+            disasmCache_.clear();
+            return;
+        }
+        std::ranges::fill(buffer_, 0);
+        readSuccess_ = (dr.Read(base_, buffer_.data(), buffer_.size()));
+        if (!readSuccess_)
+        {
+            disasmCache_.clear();
+            return;
+        }
+        if (format_ == Types::ViewFormat::Disasm)
+        {
+            disasmCache_.clear();
+            disasmScrollIdx_ = 0;
+            if (disasm_.IsValid() && !buffer_.empty())
+            {
+                // 安全限制：哪怕 buffer_ 特别大，最多只让 Capstone 一次解 500 条指令
+                disasmCache_ = disasm_.Disassemble(base_, buffer_.data(), buffer_.size(), 500);
+            }
+        }
+    }
+
+    bool applyOffset(std::string_view offsetStr)
+    {
+        auto result = MemUtils::ParseHexOffset(offsetStr);
+        if (!result)
+            return false;
+        open(result->negative ? (base_ - result->offset) : (base_ + result->offset));
+        return true;
+    }
+
+private:
+    void moveDisasm(int lines)
+    {
+        if (lines == 0)
+            return;
+
+        int newIdx = disasmScrollIdx_ + lines;
+
+        int margin = std::min(50, static_cast<int>(disasmCache_.size() / 4));
+        if (margin < 0)
+            margin = 0;
+
+        if (disasmCache_.empty() || newIdx < 0 || newIdx + margin >= static_cast<int>(disasmCache_.size()))
+        {
+            // ARM64 中，1 行指令 = 4 字节
+            int64_t deltaBytes = static_cast<int64_t>(newIdx) * 4;
+
+            if (deltaBytes < 0 && base_ < static_cast<uintptr_t>(-deltaBytes))
+            {
+                base_ = 0;
+            }
+            else
+            {
+                base_ += deltaBytes;
+            }
+
+            // 强制 4 字节对齐，防止计算偏差
+            base_ &= ~static_cast<uintptr_t>(3);
+
+            disasmScrollIdx_ = 0;
+            refresh();
+        }
+        else
+        {
+            disasmScrollIdx_ = newIdx;
+        }
+    }
+};
+
+// ============================================================================
 // 指针管理器
 // ============================================================================
 class PointerManager
@@ -2409,239 +2643,6 @@ public:
     }
 };
 
-// ============================================================================
-// 锁定管理器
-// ============================================================================
-class LockManager
-{
-private:
-    struct LockItem
-    {
-        uintptr_t addr;
-        Types::DataType type;
-        std::string value;
-    };
-    std::list<LockItem> locks_;
-    mutable std::mutex mutex_;
-    std::jthread writeThread_;
-
-    auto find(uintptr_t addr)
-    {
-        return std::ranges::find_if(locks_, [addr](auto &i)
-                                    { return i.addr == addr; });
-    }
-
-    void writeLoop(std::stop_token stoken)
-    {
-        while (!stoken.stop_requested() && Config::g_Running)
-        {
-            {
-                std::lock_guard lock(mutex_);
-                for (auto &item : locks_)
-                    MemUtils::WriteFromString(item.addr, item.type, item.value);
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-    }
-
-public:
-    LockManager()
-        : writeThread_([this](std::stop_token st)
-                       { writeLoop(st); }) {}
-
-    ~LockManager() { writeThread_.request_stop(); }
-
-    bool isLocked(uintptr_t addr) const
-    {
-        std::lock_guard lock(mutex_);
-        return std::ranges::any_of(locks_, [addr](const auto &i)
-                                   { return i.addr == addr; });
-    }
-
-    void toggle(uintptr_t addr, Types::DataType type)
-    {
-        std::lock_guard lock(mutex_);
-        if (auto it = find(addr); it != locks_.end())
-            locks_.erase(it);
-        else
-            locks_.push_back({addr, type, MemUtils::ReadAsString(addr, type)});
-    }
-
-    void lock(uintptr_t addr, Types::DataType type, const std::string &value)
-    {
-        std::lock_guard lk(mutex_);
-        if (find(addr) == locks_.end())
-            locks_.push_back({addr, type, value});
-    }
-
-    void unlock(uintptr_t addr)
-    {
-        std::lock_guard lk(mutex_);
-        std::erase_if(locks_, [addr](const auto &item)
-                      { return item.addr == addr; });
-    }
-
-    void lockBatch(std::span<const uintptr_t> addrs, Types::DataType type)
-    {
-        std::lock_guard lk(mutex_);
-        for (auto addr : addrs)
-        {
-            if (!std::ranges::any_of(locks_, [addr](const auto &item)
-                                     { return item.addr == addr; }))
-                locks_.emplace_back(addr, type, MemUtils::ReadAsString(addr, type));
-        }
-    }
-
-    void unlockBatch(std::span<const uintptr_t> addrs)
-    {
-        std::lock_guard lk(mutex_);
-        for (auto addr : addrs)
-            std::erase_if(locks_, [addr](const auto &item)
-                          { return item.addr == addr; });
-    }
-
-    void clear()
-    {
-        std::lock_guard lk(mutex_);
-        locks_.clear();
-    }
-};
-
-// ============================================================================
-// 内存浏览器
-// ============================================================================
-class MemViewer
-{
-private:
-    uintptr_t base_ = 0;
-    Types::ViewFormat format_ = Types::ViewFormat::Hex;
-    std::vector<uint8_t> buffer_;
-    bool visible_ = false;
-    bool readSuccess_ = false;
-    Disasm::Disassembler disasm_;
-    std::vector<Disasm::DisasmLine> disasmCache_;
-    int disasmScrollIdx_ = 0;
-
-public:
-    MemViewer() : buffer_(Config::Constants::MEM_VIEW_RANGE * 2) {}
-
-    bool isVisible() const noexcept { return visible_; }
-    void setVisible(bool v) noexcept { visible_ = v; }
-    Types::ViewFormat format() const noexcept { return format_; }
-    bool readSuccess() const noexcept { return readSuccess_; }
-    uintptr_t base() const noexcept { return base_; }
-    const std::vector<uint8_t> &buffer() const noexcept { return buffer_; }
-    const std::vector<Disasm::DisasmLine> &getDisasm() const noexcept { return disasmCache_; }
-    int disasmScrollIdx() const noexcept { return disasmScrollIdx_; }
-
-    void setFormat(Types::ViewFormat fmt)
-    {
-        format_ = fmt;
-        disasmScrollIdx_ = 0;
-        refresh();
-    }
-
-    void open(uintptr_t addr)
-    {
-        if (format_ == Types::ViewFormat::Disasm)
-            addr &= ~static_cast<uintptr_t>(3); // 强制 4 字节对齐
-        base_ = addr;
-        disasmScrollIdx_ = 0;
-        refresh();
-        visible_ = true;
-    }
-
-    void move(int lines, size_t step)
-    {
-        if (format_ == Types::ViewFormat::Disasm)
-        {
-            moveDisasm(lines);
-        }
-        else
-        {
-            int64_t delta = static_cast<int64_t>(lines) * static_cast<int64_t>(step);
-            if (delta < 0 && base_ < static_cast<uintptr_t>(-delta))
-                base_ = 0;
-            else
-                base_ += delta;
-            refresh();
-        }
-    }
-
-    void refresh()
-    {
-        if (base_ > Config::Constants::ADDR_MAX)
-        {
-            readSuccess_ = false;
-            disasmCache_.clear();
-            return;
-        }
-        std::ranges::fill(buffer_, 0);
-        readSuccess_ = (dr.Read(base_, buffer_.data(), buffer_.size()));
-        if (!readSuccess_)
-        {
-            disasmCache_.clear();
-            return;
-        }
-        if (format_ == Types::ViewFormat::Disasm)
-        {
-            disasmCache_.clear();
-            disasmScrollIdx_ = 0;
-            if (disasm_.IsValid() && !buffer_.empty())
-            {
-                // 安全限制：哪怕 buffer_ 特别大，最多只让 Capstone 一次解 500 条指令
-                disasmCache_ = disasm_.Disassemble(base_, buffer_.data(), buffer_.size(), 500);
-            }
-        }
-    }
-
-    bool applyOffset(std::string_view offsetStr)
-    {
-        auto result = MemUtils::ParseHexOffset(offsetStr);
-        if (!result)
-            return false;
-        open(result->negative ? (base_ - result->offset) : (base_ + result->offset));
-        return true;
-    }
-
-private:
-    void moveDisasm(int lines)
-    {
-        if (lines == 0)
-            return;
-
-        int newIdx = disasmScrollIdx_ + lines;
-
-        int margin = std::min(50, static_cast<int>(disasmCache_.size() / 4));
-        if (margin < 0)
-            margin = 0;
-
-        if (disasmCache_.empty() || newIdx < 0 || newIdx + margin >= static_cast<int>(disasmCache_.size()))
-        {
-            // ARM64 中，1 行指令 = 4 字节
-            int64_t deltaBytes = static_cast<int64_t>(newIdx) * 4;
-
-            if (deltaBytes < 0 && base_ < static_cast<uintptr_t>(-deltaBytes))
-            {
-                base_ = 0;
-            }
-            else
-            {
-                base_ += deltaBytes;
-            }
-
-            // 强制 4 字节对齐，防止计算偏差
-            base_ &= ~static_cast<uintptr_t>(3);
-
-            disasmScrollIdx_ = 0;
-            refresh();
-        }
-        else
-        {
-            disasmScrollIdx_ = newIdx;
-        }
-    }
-};
 
 // ============================================================================
 // UI 构建器

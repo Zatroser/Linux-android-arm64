@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmd //c \"E:\\\\android-ndk-r29\\\\ndk-build.cmd NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=./Android.mk\")",
+      "Bash(cmd //c \"E:\\\\android-ndk-r29\\\\ndk-build.cmd NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=./Android.mk APP_APPLICATION_MK=./Application.mk\")"
+    ]
+  }
+}
