@@ -10,12 +10,14 @@ import sys
 import threading
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QMouseEvent, QTextCursor, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -31,6 +33,92 @@ from PySide6.QtWidgets import (
 
 DEFAULT_PORT = 9494
 NETWORK_TIMEOUT_SECONDS = 6
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+BROWSER_CACHE_RADIUS_BYTES = 4096
+BROWSER_WINDOW_BYTES = BROWSER_CACHE_RADIUS_BYTES * 2
+BROWSER_VISIBLE_BYTES = 256
+BROWSER_DISASM_WINDOW_LINES = 220
+VALUE_TYPE_OPTIONS = (
+    ("I8", "I8"),
+    ("I16", "I16"),
+    ("I32", "I32"),
+    ("I64", "I64"),
+    ("Float", "Float"),
+    ("Double", "Double"),
+)
+
+
+class BrowserTextEdit(QTextEdit):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.wheel_navigate_handler = None
+        self.drag_autoscroll_timer = QTimer(self)
+        self.drag_autoscroll_timer.setInterval(40)
+        self.drag_autoscroll_timer.timeout.connect(self._auto_scroll_selection)
+        self.selection_drag_active = False
+        self.last_drag_pos = QPoint()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        if callable(self.wheel_navigate_handler) and not (event.modifiers() & Qt.ControlModifier):
+            delta_y = event.angleDelta().y()
+            if delta_y == 0 and not event.pixelDelta().isNull():
+                delta_y = event.pixelDelta().y()
+            if delta_y != 0 and self.wheel_navigate_handler(delta_y):
+                event.accept()
+                return
+        super().wheelEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self.selection_drag_active = True
+            self.last_drag_pos = event.position().toPoint()
+            self.drag_autoscroll_timer.start()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self.selection_drag_active:
+            self.last_drag_pos = event.position().toPoint()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self.selection_drag_active = False
+            self.drag_autoscroll_timer.stop()
+        super().mouseReleaseEvent(event)
+
+    def _auto_scroll_selection(self) -> None:
+        if not self.selection_drag_active or not (QApplication.mouseButtons() & Qt.LeftButton):
+            self.selection_drag_active = False
+            self.drag_autoscroll_timer.stop()
+            return
+
+        view_rect = self.viewport().rect()
+        margin = 20
+        scroll_bar = self.verticalScrollBar()
+        scroll_delta = 0
+
+        if self.last_drag_pos.y() < margin:
+            scroll_delta = -max(1, self.fontMetrics().lineSpacing())
+        elif self.last_drag_pos.y() > view_rect.height() - margin:
+            scroll_delta = max(1, self.fontMetrics().lineSpacing())
+
+        if scroll_delta == 0:
+            return
+
+        scroll_bar.setValue(
+            max(scroll_bar.minimum(), min(scroll_bar.maximum(), scroll_bar.value() + scroll_delta))
+        )
+
+        anchor = self.textCursor().anchor()
+        clamped_pos = QPoint(
+            min(max(self.last_drag_pos.x(), 0), max(0, view_rect.width() - 1)),
+            min(max(self.last_drag_pos.y(), 0), max(0, view_rect.height() - 1)),
+        )
+        target_cursor = self.cursorForPosition(clamped_pos)
+        selection_cursor = self.textCursor()
+        selection_cursor.setPosition(anchor, QTextCursor.MoveAnchor)
+        selection_cursor.setPosition(target_cursor.position(), QTextCursor.KeepAnchor)
+        self.setTextCursor(selection_cursor)
 
 
 class TcpTestWindow(QWidget):
@@ -50,6 +138,9 @@ class TcpTestWindow(QWidget):
         self.hwbp_refresh_inflight = False
         self.saved_items: list[dict[str, str]] = []
         self.browser_base_addr = 0
+        self.browser_cache_base = 0
+        self.browser_cache_data = b""
+        self.browser_current_addr = 0
         self.hwbp_info_data: dict | None = None
         self.live_refresh_timer = QTimer(self)
         self.live_refresh_timer.setInterval(1000)
@@ -97,11 +188,11 @@ class TcpTestWindow(QWidget):
 
         self.tabs.addTab(self.memory_page, "内存信息页")
         self.tabs.addTab(self.search_page, "扫描页")
+        self.tabs.addTab(self.save_page, "保存页")
         self.tabs.addTab(self.browser_page, "内存浏览页")
         self.tabs.addTab(self.pointer_page, "指针页")
         self.tabs.addTab(self.breakpoint_page, "断点页")
         self.tabs.addTab(self.signature_page, "特征码页")
-        self.tabs.addTab(self.save_page, "保存页")
         self.tabs.addTab(self.log_page, "日志页")
         self.tabs.addTab(self.settings_page, "设置页")
         self.tabs.currentChanged.connect(self.on_tab_changed)
@@ -303,28 +394,21 @@ class TcpTestWindow(QWidget):
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("类型:"))
         self.scan_type_combo = QComboBox()
-        self.scan_type_combo.addItem("I8", "I8")
-        self.scan_type_combo.addItem("I16", "I16")
-        self.scan_type_combo.addItem("I32", "I32")
-        self.scan_type_combo.addItem("I64", "I64")
-        self.scan_type_combo.addItem("Float", "Float")
-        self.scan_type_combo.addItem("Double", "Double")
-        i32_index = self.scan_type_combo.findData("I32")
-        self.scan_type_combo.setCurrentIndex(i32_index if i32_index >= 0 else 0)
+        self._populate_value_type_combo(self.scan_type_combo)
         row1.addWidget(self.scan_type_combo)
 
         row1.addWidget(QLabel("模式:"))
         self.scan_mode_combo = QComboBox()
-        self.scan_mode_combo.addItem("Unknown", "unknown")
-        self.scan_mode_combo.addItem("Equal", "eq")
-        self.scan_mode_combo.addItem("Greater", "gt")
-        self.scan_mode_combo.addItem("Less", "lt")
-        self.scan_mode_combo.addItem("Increased", "inc")
-        self.scan_mode_combo.addItem("Decreased", "dec")
-        self.scan_mode_combo.addItem("Changed", "changed")
-        self.scan_mode_combo.addItem("Unchanged", "unchanged")
-        self.scan_mode_combo.addItem("Range", "range")
-        self.scan_mode_combo.addItem("Pointer", "pointer")
+        self.scan_mode_combo.addItem("未知", "unknown")
+        self.scan_mode_combo.addItem("等于", "eq")
+        self.scan_mode_combo.addItem("大于", "gt")
+        self.scan_mode_combo.addItem("小于", "lt")
+        self.scan_mode_combo.addItem("增加", "inc")
+        self.scan_mode_combo.addItem("减少", "dec")
+        self.scan_mode_combo.addItem("已变化", "changed")
+        self.scan_mode_combo.addItem("未变化", "unchanged")
+        self.scan_mode_combo.addItem("范围", "range")
+        self.scan_mode_combo.addItem("指针", "pointer")
         eq_index = self.scan_mode_combo.findData("eq")
         self.scan_mode_combo.setCurrentIndex(eq_index if eq_index >= 0 else 0)
         row1.addWidget(self.scan_mode_combo)
@@ -394,14 +478,16 @@ class TcpTestWindow(QWidget):
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("地址:"))
         self.browser_addr_input = QLineEdit("0x0")
-        self.browser_addr_input.setPlaceholderText("输入起始地址，如 0x12345678")
+        self.browser_addr_input.setPlaceholderText("输入起始地址，如 0x12345678 或 0x12345678+0xA8")
         self.browser_addr_input.returnPressed.connect(self.on_browser_read)
         row1.addWidget(self.browser_addr_input, 1)
 
-        row1.addWidget(QLabel("大小:"))
-        self.browser_size_input = QLineEdit("256")
-        self.browser_size_input.setMaximumWidth(120)
-        row1.addWidget(self.browser_size_input)
+        row1.addWidget(QLabel("缓存:"))
+        self.browser_size_label = QLabel(
+            f"{BROWSER_WINDOW_BYTES} 字节缓存（上/下各 {BROWSER_CACHE_RADIUS_BYTES}）"
+        )
+        self.browser_size_label.setMinimumWidth(120)
+        row1.addWidget(self.browser_size_label)
 
         row1.addWidget(QLabel("显示:"))
         self.browser_view_combo = QComboBox()
@@ -421,20 +507,13 @@ class TcpTestWindow(QWidget):
         self.browser_read_button = QPushButton("读取")
         self.browser_read_button.clicked.connect(self.on_browser_read)
         row2.addWidget(self.browser_read_button)
-
-        self.browser_prev_button = QPushButton("上移")
-        self.browser_prev_button.clicked.connect(self.on_browser_prev)
-        row2.addWidget(self.browser_prev_button)
-
-        self.browser_next_button = QPushButton("下移")
-        self.browser_next_button.clicked.connect(self.on_browser_next)
-        row2.addWidget(self.browser_next_button)
         row2.addStretch(1)
         layout.addLayout(row2)
 
-        self.browser_view = QTextEdit()
+        self.browser_view = BrowserTextEdit()
         self.browser_view.setReadOnly(True)
         self.browser_view.setPlaceholderText("内存浏览结果将显示在这里。")
+        self.browser_view.wheel_navigate_handler = self.on_browser_wheel_navigate
         layout.addWidget(self.browser_view, 1)
 
     def _build_pointer_page(self) -> None:
@@ -572,24 +651,25 @@ class TcpTestWindow(QWidget):
         action_row.addStretch(1)
         layout.addLayout(action_row)
 
-        record_row = QHBoxLayout()
-        record_row.addWidget(QLabel("hwbp_record 索引:"))
-        self.hwbp_record_combo = QComboBox()
-        self.hwbp_record_combo.addItem("无记录", "-1")
-        self.hwbp_record_combo.currentIndexChanged.connect(self.on_hwbp_record_combo_changed)
-        record_row.addWidget(self.hwbp_record_combo, 1)
+        edit_row = QHBoxLayout()
+        edit_row.addWidget(QLabel("写入字段:"))
+        self.hwbp_field_combo = QComboBox()
+        for field_name in ["pc", "lr", "sp", "pstate", "orig_x0", "syscallno"]:
+            self.hwbp_field_combo.addItem(field_name, field_name)
+        for reg_idx in range(30):
+            field_name = f"x{reg_idx}"
+            self.hwbp_field_combo.addItem(field_name, field_name)
+        edit_row.addWidget(self.hwbp_field_combo)
 
-        record_row.addWidget(QLabel("手动索引:"))
-        self.hwbp_record_index_input = QLineEdit("0")
-        self.hwbp_record_index_input.setMaximumWidth(100)
-        record_row.addWidget(self.hwbp_record_index_input)
-        self.hwbp_remove_record_button = QPushButton("删除记录")
-        self.hwbp_remove_record_button.clicked.connect(self.on_hwbp_remove_record)
-        record_row.addWidget(self.hwbp_remove_record_button)
-        self.hwbp_record_count_label = QLabel("hwbp_info.record_count: 0")
-        record_row.addWidget(self.hwbp_record_count_label)
-        record_row.addStretch(1)
-        layout.addLayout(record_row)
+        edit_row.addWidget(QLabel("写入值:"))
+        self.hwbp_value_input = QLineEdit("0x0")
+        self.hwbp_value_input.setPlaceholderText("输入十六进制或十进制值")
+        edit_row.addWidget(self.hwbp_value_input, 1)
+
+        self.hwbp_write_button = QPushButton("写入寄存器")
+        self.hwbp_write_button.clicked.connect(self.on_hwbp_write_field)
+        edit_row.addWidget(self.hwbp_write_button)
+        layout.addLayout(edit_row)
 
         self.hwbp_tree = QTreeWidget()
         self.hwbp_tree.setHeaderLabels(["断点记录（按 PC 折叠）"])
@@ -615,7 +695,7 @@ class TcpTestWindow(QWidget):
         scan_row.addWidget(QLabel("文件:"))
         self.sig_file_input = QLineEdit("Signature.txt")
         scan_row.addWidget(self.sig_file_input, 1)
-        self.sig_scan_addr_button = QPushButton("ScanAddressSignature")
+        self.sig_scan_addr_button = QPushButton("找特征")
         self.sig_scan_addr_button.clicked.connect(self.on_sig_scan_address)
         scan_row.addWidget(self.sig_scan_addr_button)
         layout.addLayout(scan_row)
@@ -625,12 +705,9 @@ class TcpTestWindow(QWidget):
         self.sig_verify_addr_input = QLineEdit("0x0")
         self.sig_verify_addr_input.setPlaceholderText("过滤 Signature.txt")
         filter_row.addWidget(self.sig_verify_addr_input, 1)
-        self.sig_filter_button = QPushButton("FilterSignature")
+        self.sig_filter_button = QPushButton("过滤特征")
         self.sig_filter_button.clicked.connect(self.on_sig_filter)
         filter_row.addWidget(self.sig_filter_button)
-        self.sig_scan_file_button = QPushButton("ScanSignatureFromFile")
-        self.sig_scan_file_button.clicked.connect(self.on_sig_scan_file)
-        filter_row.addWidget(self.sig_scan_file_button)
         layout.addLayout(filter_row)
 
         pattern_row = QHBoxLayout()
@@ -642,7 +719,7 @@ class TcpTestWindow(QWidget):
         self.sig_pattern_range_input = QLineEdit("0")
         self.sig_pattern_range_input.setMaximumWidth(100)
         pattern_row.addWidget(self.sig_pattern_range_input)
-        self.sig_scan_pattern_button = QPushButton("ScanSignature(pattern)")
+        self.sig_scan_pattern_button = QPushButton("扫特征")
         self.sig_scan_pattern_button.clicked.connect(self.on_sig_scan_pattern)
         pattern_row.addWidget(self.sig_scan_pattern_button)
         layout.addLayout(pattern_row)
@@ -666,6 +743,21 @@ class TcpTestWindow(QWidget):
         row.addWidget(self.clear_saved_button)
         row.addStretch(1)
         layout.addLayout(row)
+
+        manual_row = QHBoxLayout()
+        manual_row.addWidget(QLabel("手动添加:"))
+        self.saved_manual_addr_input = QLineEdit()
+        self.saved_manual_addr_input.setPlaceholderText("输入地址，如 0x12345678")
+        self.saved_manual_addr_input.returnPressed.connect(self.on_add_saved_item)
+        manual_row.addWidget(self.saved_manual_addr_input, 1)
+        manual_row.addWidget(QLabel("类型:"))
+        self.saved_manual_type_combo = QComboBox()
+        self._populate_value_type_combo(self.saved_manual_type_combo)
+        manual_row.addWidget(self.saved_manual_type_combo)
+        self.saved_manual_add_button = QPushButton("添加地址")
+        self.saved_manual_add_button.clicked.connect(self.on_add_saved_item)
+        manual_row.addWidget(self.saved_manual_add_button)
+        layout.addLayout(manual_row)
 
         self.saved_view = QTextEdit()
         self.saved_view.setReadOnly(True)
@@ -918,9 +1010,10 @@ class TcpTestWindow(QWidget):
         self.hwbp_num_brps_label.setText("hwbp_info.num_brps: 0")
         self.hwbp_num_wrps_label.setText("hwbp_info.num_wrps: 0")
         self.hwbp_hit_addr_label.setText("hwbp_info.hit_addr: 0x0")
-        self.hwbp_record_count_label.setText("hwbp_info.record_count: 0")
-        self.hwbp_record_combo.clear()
-        self.hwbp_record_combo.addItem("无记录", "-1")
+        self.browser_base_addr = 0
+        self.browser_cache_base = 0
+        self.browser_cache_data = b""
+        self.browser_current_addr = 0
         self.hwbp_tree.clear()
         if reason:
             self._set_status(reason)
@@ -983,8 +1076,8 @@ class TcpTestWindow(QWidget):
                 return None
 
             self.rx_buffer += data
-            if len(self.rx_buffer) > 65536:
-                self._disconnect_device("连接已断开：响应数据异常")
+            if len(self.rx_buffer) > MAX_RESPONSE_BYTES:
+                self._disconnect_device("连接已断开：响应数据过大")
                 return None
 
     def _send_tcp_command(self, command: str, *, log_enabled: bool = True) -> str | None:
@@ -1116,6 +1209,13 @@ class TcpTestWindow(QWidget):
         end_val = self._safe_int(region.get("end"), 0)
         tokens = [f"0x{start_val:x}", f"0x{end_val:x}", str(start_val), str(end_val)]
         return any(keyword in token for token in tokens)
+
+    def _populate_value_type_combo(self, combo: QComboBox, *, default_type: str = "I32") -> None:
+        combo.clear()
+        for label, data in VALUE_TYPE_OPTIONS:
+            combo.addItem(label, data)
+        index = combo.findData(default_type)
+        combo.setCurrentIndex(index if index >= 0 else 0)
 
     def _filter_memory_info(self, info: dict, keyword: str) -> dict:
         keyword_text = keyword.strip().lower()
@@ -1283,9 +1383,11 @@ class TcpTestWindow(QWidget):
         return None
 
     @staticmethod
-    def _append_hwbp_tree_field(parent: QTreeWidgetItem, text: str) -> QTreeWidgetItem:
+    def _make_hwbp_field_item(index: int, field_name: str, value: int, text: str) -> QTreeWidgetItem:
         item = QTreeWidgetItem([text])
-        parent.addChild(item)
+        item.setData(0, Qt.UserRole, index)
+        item.setData(0, Qt.UserRole + 2, field_name)
+        item.setData(0, Qt.UserRole + 3, f"0x{value:X}")
         return item
 
     def _extract_hwbp_index_from_tree_item(self, item: QTreeWidgetItem | None) -> int | None:
@@ -1301,6 +1403,81 @@ class TcpTestWindow(QWidget):
                     return idx
             current = current.parent()
         return None
+
+    def _extract_hwbp_group_pc_from_tree_item(self, item: QTreeWidgetItem | None) -> int | None:
+        current = item
+        while current is not None:
+            data = current.data(0, Qt.UserRole + 1)
+            if data is not None:
+                try:
+                    pc = int(str(data), 10)
+                except (TypeError, ValueError):
+                    pc = -1
+                if pc >= 0:
+                    return pc
+            current = current.parent()
+        return None
+
+    def _build_hwbp_group_payload(self, pc: int) -> dict | None:
+        if pc < 0 or not isinstance(self.hwbp_info_data, dict):
+            return None
+        records_raw = self.hwbp_info_data.get("records")
+        records = records_raw if isinstance(records_raw, list) else []
+        matched_records = [
+            record
+            for record in records
+            if isinstance(record, dict) and self._safe_int(record.get("pc"), -1) == pc
+        ]
+        if not matched_records:
+            return None
+        total_hit = sum(self._safe_int(record.get("hit_count"), 0) for record in matched_records)
+        type_tags = sorted({self._decode_hwbp_rw_text(record) for record in matched_records})
+        return {
+            "pc": pc,
+            "pc_hex": f"0x{pc:X}",
+            "record_count": len(matched_records),
+            "total_hit_count": total_hit,
+            "types": type_tags,
+            "records": matched_records,
+        }
+
+    def _remove_hwbp_group(self, group_payload: dict) -> None:
+        records_raw = group_payload.get("records")
+        records = records_raw if isinstance(records_raw, list) else []
+        indices = sorted(
+            {
+                self._safe_int(record.get("index"), -1)
+                for record in records
+                if isinstance(record, dict) and self._safe_int(record.get("index"), -1) >= 0
+            },
+            reverse=True,
+        )
+        if not indices:
+            QMessageBox.warning(self, "删除失败", "当前折叠下没有可删除的 hwbp_record。")
+            return
+
+        success_count = 0
+        failed_indices: list[int] = []
+        for idx in indices:
+            response = self._send_tcp_command(f"hwbp.record.remove {idx}")
+            if response is not None and response.startswith("ok "):
+                success_count += 1
+            else:
+                failed_indices.append(idx)
+
+        self.on_hwbp_refresh(silent=True)
+
+        pc = self._safe_int(group_payload.get("pc"), 0)
+        if failed_indices:
+            failed_text = ", ".join(str(idx) for idx in failed_indices)
+            QMessageBox.warning(self, "删除失败", f"折叠删除未完全成功，失败索引: {failed_text}")
+            self._set_status(f"已删除 PC 0x{pc:X} 折叠中的 {success_count} 条，失败 {len(failed_indices)} 条")
+            return
+
+        self._set_status(f"已删除 PC 0x{pc:X} 折叠，共 {success_count} 条记录")
+
+    def _get_selected_hwbp_index(self) -> int | None:
+        return self._extract_hwbp_index_from_tree_item(self.hwbp_tree.currentItem())
 
     def _decode_hwbp_rw_text(self, rec: dict) -> str:
         rw_text = str(rec.get("rw", "")).lower()
@@ -1319,7 +1496,8 @@ class TcpTestWindow(QWidget):
             pc_val = self._safe_int(top_item.data(0, Qt.UserRole + 1), -1)
             if pc_val >= 0:
                 prev_expanded_pc.add(pc_val)
-        prev_selected_idx = self._extract_hwbp_index_from_tree_item(self.hwbp_tree.currentItem())
+        had_previous_items = self.hwbp_tree.topLevelItemCount() > 0
+        old_scroll = self.hwbp_tree.verticalScrollBar().value()
 
         self.hwbp_tree.clear()
         if not records:
@@ -1341,82 +1519,64 @@ class TcpTestWindow(QWidget):
             )
             top.setData(0, Qt.UserRole + 1, pc)
             self.hwbp_tree.addTopLevelItem(top)
-            if pc in prev_expanded_pc:
-                top.setExpanded(True)
+            top.setExpanded((not had_previous_items) or (pc in prev_expanded_pc))
 
             for rec in rec_list:
                 idx = self._safe_int(rec.get("index"), -1)
                 hit_count = self._safe_int(rec.get("hit_count"), 0)
                 rw_text = self._decode_hwbp_rw_text(rec)
-                entry = QTreeWidgetItem([f"[{idx}] 命中 {hit_count} 次  |  类型 {rw_text}"])
-                entry.setData(0, Qt.UserRole, idx)
-                top.addChild(entry)
+                summary_item = QTreeWidgetItem([f"[{idx}] 命中 {hit_count} 次  |  类型 {rw_text}"])
+                summary_item.setData(0, Qt.UserRole, idx)
+                top.addChild(summary_item)
 
                 lr = self._safe_int(rec.get("lr"), 0)
                 sp = self._safe_int(rec.get("sp"), 0)
                 orig_x0 = self._safe_int(rec.get("orig_x0"), 0)
                 syscallno = self._safe_int(rec.get("syscallno"), 0)
                 pstate = self._safe_int(rec.get("pstate"), 0)
-                self._append_hwbp_tree_field(entry, f"LR: 0x{lr:X}")
-                self._append_hwbp_tree_field(entry, f"SP: 0x{sp:X}")
-                self._append_hwbp_tree_field(entry, f"ORIG_X0: 0x{orig_x0:X}")
-                self._append_hwbp_tree_field(entry, f"SYSCALLNO: {syscallno}")
-                self._append_hwbp_tree_field(entry, f"PSTATE: 0x{pstate:X}")
+                top.addChild(self._make_hwbp_field_item(idx, "pc", pc, f"  PC: 0x{pc:X}"))
+                top.addChild(self._make_hwbp_field_item(idx, "lr", lr, f"  LR: 0x{lr:X}"))
+                top.addChild(self._make_hwbp_field_item(idx, "sp", sp, f"  SP: 0x{sp:X}"))
+                top.addChild(self._make_hwbp_field_item(idx, "orig_x0", orig_x0, f"  ORIG_X0: 0x{orig_x0:X}"))
+                top.addChild(self._make_hwbp_field_item(idx, "syscallno", syscallno, f"  SYSCALLNO: {syscallno}"))
+                top.addChild(self._make_hwbp_field_item(idx, "pstate", pstate, f"  PSTATE: 0x{pstate:X}"))
 
                 regs_raw = rec.get("regs")
                 regs = regs_raw if isinstance(regs_raw, list) else []
-                regs_item = QTreeWidgetItem(["寄存器快照 X0~X29"])
-                entry.addChild(regs_item)
+                regs_title = QTreeWidgetItem(["  寄存器快照 X0~X29"])
+                regs_title.setData(0, Qt.UserRole, idx)
+                top.addChild(regs_title)
                 for reg_idx, reg_val in enumerate(regs):
                     reg_hex = self._safe_int(reg_val, 0)
-                    QTreeWidgetItem(regs_item, [f"X{reg_idx}: 0x{reg_hex:X}"])
+                    top.addChild(self._make_hwbp_field_item(idx, f"x{reg_idx}", reg_hex, f"    X{reg_idx}: 0x{reg_hex:X}"))
 
                 if rw_text == "写入":
-                    write_item = QTreeWidgetItem(["写入寄存器候选"])
-                    entry.addChild(write_item)
+                    write_title = QTreeWidgetItem(["  写入寄存器候选"])
+                    write_title.setData(0, Qt.UserRole, idx)
+                    top.addChild(write_title)
                     x0_val = self._safe_int(regs[0], 0) if len(regs) > 0 else 0
                     x1_val = self._safe_int(regs[1], 0) if len(regs) > 1 else 0
-                    QTreeWidgetItem(write_item, [f"候选写入值(X0): 0x{x0_val:X}"])
-                    QTreeWidgetItem(write_item, [f"候选写入地址(X1): 0x{x1_val:X}"])
+                    top.addChild(self._make_hwbp_field_item(idx, "x0", x0_val, f"    候选写入值(X0): 0x{x0_val:X}"))
+                    top.addChild(self._make_hwbp_field_item(idx, "x1", x1_val, f"    候选写入地址(X1): 0x{x1_val:X}"))
 
-        if prev_selected_idx is not None:
-            for i in range(self.hwbp_tree.topLevelItemCount()):
-                top = self.hwbp_tree.topLevelItem(i)
-                if top is None:
-                    continue
-                for j in range(top.childCount()):
-                    child = top.child(j)
-                    if child is None:
-                        continue
-                    idx = self._safe_int(child.data(0, Qt.UserRole), -1)
-                    if idx == prev_selected_idx:
-                        self.hwbp_tree.setCurrentItem(child)
-                        break
+                separator = QTreeWidgetItem([""])
+                separator.setData(0, Qt.UserRole, idx)
+                top.addChild(separator)
 
         self.hwbp_tree.resizeColumnToContents(0)
+        self.hwbp_tree.verticalScrollBar().setValue(
+            min(old_scroll, self.hwbp_tree.verticalScrollBar().maximum())
+        )
 
     def _render_hwbp_info(self, info: dict) -> None:
         num_brps = self._safe_int(info.get("num_brps"), 0)
         num_wrps = self._safe_int(info.get("num_wrps"), 0)
         hit_addr = self._safe_int(info.get("hit_addr"), 0)
-        record_count = self._safe_int(info.get("record_count"), 0)
         self.hwbp_num_brps_label.setText(f"hwbp_info.num_brps: {num_brps}")
         self.hwbp_num_wrps_label.setText(f"hwbp_info.num_wrps: {num_wrps}")
         self.hwbp_hit_addr_label.setText(f"hwbp_info.hit_addr: 0x{hit_addr:X}")
-        self.hwbp_record_count_label.setText(f"hwbp_info.record_count: {record_count}")
-        self.hwbp_record_combo.clear()
         records_raw = info.get("records")
         records = records_raw if isinstance(records_raw, list) else []
-        if not records:
-            self.hwbp_record_combo.addItem("无记录", "-1")
-        else:
-            for item in records:
-                if not isinstance(item, dict):
-                    continue
-                idx = self._safe_int(item.get("index"), -1)
-                pc = self._safe_int(item.get("pc"), 0)
-                hit_count = self._safe_int(item.get("hit_count"), 0)
-                self.hwbp_record_combo.addItem(f"idx={idx} pc=0x{pc:X} hit={hit_count}", str(idx))
         self._render_hwbp_tree(records)
 
     @staticmethod
@@ -1510,6 +1670,44 @@ class TcpTestWindow(QWidget):
         return response.split("value=", 1)[1].strip()
 
     @staticmethod
+    def _normalize_saved_note(note_text: str) -> str:
+        return " ".join(part.strip() for part in note_text.replace("\r", "\n").split("\n") if part.strip())
+
+    def _append_saved_item(self, addr: str, value: str, type_token: str, *, note: str = "") -> None:
+        self.saved_items.append(
+            {
+                "addr": addr,
+                "value": value,
+                "type": type_token,
+                "locked": "0",
+                "note": self._normalize_saved_note(note),
+            }
+        )
+
+    def _read_saved_item_value(self, type_token: str, addr: str) -> str:
+        if not self._is_connected():
+            return ""
+        command = self._build_read_command_for_type(type_token, addr)
+        if command is None:
+            return ""
+        response = self._send_tcp_command(command, log_enabled=False)
+        value = self._extract_value_field(response)
+        return value if value is not None else ""
+
+    def _ensure_saved_item_value(self, item: dict[str, str]) -> bool:
+        if item.get("value", ""):
+            return True
+        addr = item.get("addr", "")
+        type_token = item.get("type", "")
+        if not addr or not type_token:
+            return False
+        value = self._read_saved_item_value(type_token, addr)
+        if not value:
+            return False
+        item["value"] = value
+        return True
+
+    @staticmethod
     def _set_text_preserve_interaction(editor: QTextEdit, text: str) -> bool:
         if editor.toPlainText() == text:
             return True
@@ -1538,10 +1736,12 @@ class TcpTestWindow(QWidget):
         lines = []
         for idx, item in enumerate(self.saved_items, start=1):
             addr = item.get("addr", "")
-            value = item.get("value", "")
+            value = item.get("value", "") or "--"
             type_token = item.get("type", "")
             lock_text = "锁定" if item.get("locked", "0") == "1" else "未锁"
-            lines.append(f"{idx}. {addr} | {value} | {type_token} | {lock_text}")
+            note = self._normalize_saved_note(item.get("note", ""))
+            note_text = f" | 备注: {note}" if note else ""
+            lines.append(f"{idx}. {addr} | {value} | {type_token} | {lock_text}{note_text}")
         text = "\n".join(lines)
 
         if force:
@@ -1590,13 +1790,61 @@ class TcpTestWindow(QWidget):
         type_token = str(type_data).strip() if type_data is not None else self.scan_type_combo.currentText().strip()
 
         for addr, value in parsed_items:
-            self.saved_items.append({"addr": addr, "value": value, "type": type_token, "locked": "0"})
+            self._append_saved_item(addr, value, type_token)
 
         self._refresh_saved_view()
         if len(parsed_items) == 1:
             self._set_status(f"已保存: {parsed_items[0][0]} -> {parsed_items[0][1]}")
         else:
             self._set_status(f"已保存 {len(parsed_items)} 项")
+
+    def on_add_saved_item(self) -> None:
+        addr_text = self.saved_manual_addr_input.text().strip()
+        if not addr_text:
+            QMessageBox.warning(self, "输入提示", "请输入要手动添加的地址。")
+            return
+
+        try:
+            addr_value = int(addr_text, 0)
+        except ValueError:
+            QMessageBox.warning(self, "输入提示", "地址格式无效，请输入十进制或 0x 开头的十六进制。")
+            return
+
+        if addr_value < 0:
+            QMessageBox.warning(self, "输入提示", "地址不能为负数。")
+            return
+
+        type_data = self.saved_manual_type_combo.currentData()
+        type_token = str(type_data).strip() if type_data is not None else self.saved_manual_type_combo.currentText().strip()
+        addr = self._format_addr(addr_value)
+        value = self._read_saved_item_value(type_token, addr)
+
+        self._append_saved_item(addr, value, type_token)
+        self.saved_manual_addr_input.clear()
+        self._refresh_saved_view()
+        self._set_status(f"已手动添加地址: {addr}")
+        self.saved_manual_addr_input.setFocus()
+
+    def _edit_saved_item_note(self, item: dict[str, str]) -> bool:
+        addr = item.get("addr", "")
+        current_note = item.get("note", "")
+        note_text, accepted = QInputDialog.getText(
+            self,
+            "文字备注",
+            f"为地址 {addr} 设置备注：",
+            QLineEdit.Normal,
+            current_note,
+        )
+        if not accepted:
+            return False
+
+        normalized_note = self._normalize_saved_note(note_text)
+        if normalized_note == self._normalize_saved_note(current_note):
+            return False
+
+        item["note"] = normalized_note
+        self._set_status(f"已更新备注: {addr}" if normalized_note else f"已清空备注: {addr}")
+        return True
 
     def _saved_index_from_line(self, line_text: str) -> int | None:
         match = re.match(r"^\s*(\d+)\.", line_text)
@@ -1641,11 +1889,18 @@ class TcpTestWindow(QWidget):
 
         menu = QMenu(self.saved_view)
         if len(items) == 1:
+            note_action = menu.addAction("编辑备注")
+            clear_note_action = None
+            if self._normalize_saved_note(items[0].get("note", "")):
+                clear_note_action = menu.addAction("清空备注")
+            menu.addSeparator()
             # 单选：显示锁定/取消锁定
             locked = items[0].get("locked", "0") == "1"
             lock_action = menu.addAction("取消锁定" if locked else "锁定此项")
         else:
             # 多选：显示批量操作选项
+            note_action = None
+            clear_note_action = None
             lock_action = None
             actions = {}
             if unlocked_count > 0:
@@ -1656,6 +1911,15 @@ class TcpTestWindow(QWidget):
         action = menu.exec(self.saved_view.mapToGlobal(pos))
 
         if len(items) == 1:
+            if action == note_action:
+                if self._edit_saved_item_note(items[0]):
+                    self._refresh_saved_view(force=True)
+                return
+            if action == clear_note_action:
+                items[0]["note"] = ""
+                self._refresh_saved_view(force=True)
+                self._set_status(f"已清空备注: {items[0].get('addr', '')}")
+                return
             if action != lock_action:
                 return
             # 处理单项锁定/取消锁定
@@ -1675,6 +1939,10 @@ class TcpTestWindow(QWidget):
                 item["locked"] = "0"
                 self._set_status(f"已取消锁定: {addr}")
             else:
+                if not value and not self._ensure_saved_item_value(item):
+                    QMessageBox.warning(self, "锁定失败", f"锁定前读取当前值失败: {addr}")
+                    return
+                value = item.get("value", "")
                 response = self._send_tcp_command(f"lock.set {addr} {type_token} {value}")
                 if response is None or not response.startswith("ok "):
                     QMessageBox.warning(self, "锁定失败", f"锁定失败: {response}")
@@ -1700,6 +1968,10 @@ class TcpTestWindow(QWidget):
                     if not addr or not type_token:
                         fail_count += 1
                         continue
+                    if not value and not self._ensure_saved_item_value(item):
+                        fail_count += 1
+                        continue
+                    value = item.get("value", "")
                     response = self._send_tcp_command(f"lock.set {addr} {type_token} {value}")
                     if response is not None and response.startswith("ok "):
                         item["locked"] = "1"
@@ -1878,27 +2150,86 @@ class TcpTestWindow(QWidget):
         if not text:
             QMessageBox.warning(self, "输入提示", "请输入地址。")
             return None
-        try:
-            addr = int(text, 0)
-        except ValueError:
-            QMessageBox.warning(self, "输入提示", "地址格式无效。")
+        addr = self._parse_address_expression(text)
+        if addr is None:
+            QMessageBox.warning(self, "输入提示", "地址格式无效，支持如 0x12345678+0xA8。")
             return None
         if addr < 0:
             QMessageBox.warning(self, "输入提示", "地址必须为非负数。")
             return None
         return addr
 
-    def _parse_browser_size(self) -> int | None:
-        text = self.browser_size_input.text().strip()
+    @staticmethod
+    def _parse_address_expression(text: str) -> int | None:
+        expr = re.sub(r"\s+", "", text)
+        if not expr:
+            return None
+
+        parts = re.split(r"([+-])", expr)
+        if not parts:
+            return None
+
         try:
-            size = int(text, 10)
+            total = int(parts[0], 0)
         except ValueError:
-            QMessageBox.warning(self, "输入提示", "大小必须是整数。")
             return None
-        if size <= 0 or size > 4096:
-            QMessageBox.warning(self, "输入提示", "大小范围必须在 1 到 4096。")
+
+        index = 1
+        while index + 1 < len(parts):
+            operator = parts[index]
+            operand_text = parts[index + 1]
+            if operator not in {"+", "-"} or not operand_text:
+                return None
+            try:
+                operand = int(operand_text, 0)
+            except ValueError:
+                return None
+            total = total + operand if operator == "+" else total - operand
+            index += 2
+
+        if index != len(parts):
             return None
-        return size
+        return total
+
+    @staticmethod
+    def _browser_window_size() -> int:
+        return BROWSER_WINDOW_BYTES
+
+    def _browser_cache_request_base(self, addr: int) -> int:
+        if BROWSER_CACHE_RADIUS_BYTES <= 0:
+            return max(0, addr)
+        return max(0, addr - BROWSER_CACHE_RADIUS_BYTES)
+
+    def _browser_visible_size(self, view_mode: str) -> int:
+        unit = max(1, self._browser_scroll_unit(view_mode))
+        visible_size = max(unit, BROWSER_VISIBLE_BYTES - (BROWSER_VISIBLE_BYTES % unit))
+        return min(visible_size, self._browser_window_size())
+
+    def _browser_cache_contains(self, addr: int, visible_size: int) -> bool:
+        if not self.browser_cache_data:
+            return False
+        cache_start = self.browser_cache_base
+        cache_end = cache_start + len(self.browser_cache_data)
+        return cache_start <= addr and addr + visible_size <= cache_end
+
+    def _render_browser_cached_view(self, addr: int, view_mode: str) -> bool:
+        visible_size = self._browser_visible_size(view_mode)
+        if not self._browser_cache_contains(addr, visible_size):
+            return False
+
+        offset = addr - self.browser_cache_base
+        data = self.browser_cache_data[offset : offset + visible_size]
+        if view_mode == "hex":
+            text = self._render_hex_dump(addr, data)
+        elif view_mode == "hex64":
+            text = self._render_hex64_dump(addr, data)
+        else:
+            text = self._render_typed_dump(addr, data, view_mode)
+
+        self.browser_current_addr = addr
+        self.browser_addr_input.setText(f"0x{addr:X}")
+        self.browser_view.setPlainText(text)
+        return True
 
     @staticmethod
     def _hex_to_bytes(hex_text: str) -> bytes | None:
@@ -1925,20 +2256,49 @@ class TcpTestWindow(QWidget):
         }
         return mapping.get(mode_text, "hex")
 
-    def _read_browser_bytes(self, addr: int, size: int) -> bytes | None:
-        response = self._send_tcp_command(f"mem.read 0x{addr:X} {size}", log_enabled=False)
-        if response is None or not response.startswith("ok "):
-            QMessageBox.warning(self, "读取失败", f"读取内存失败: {response}")
-            return None
-        if "hex=" not in response:
-            QMessageBox.warning(self, "读取失败", f"响应格式异常: {response}")
-            return None
-        hex_text = response.split("hex=", 1)[1].strip()
-        data = self._hex_to_bytes(hex_text)
-        if data is None:
-            QMessageBox.warning(self, "读取失败", "HEX 数据解析失败。")
-            return None
-        return data
+    def _current_browser_view_mode(self) -> str:
+        mode_data = self.browser_view_combo.currentData()
+        if mode_data is not None:
+            return str(mode_data).strip()
+        return self._browser_mode_to_token(self.browser_view_combo.currentText().strip())
+
+    @staticmethod
+    def _browser_scroll_unit(view_mode: str) -> int:
+        mapping = {
+            "hex": 16,
+            "hex64": 8,
+            "i8": 1,
+            "i16": 2,
+            "i32": 4,
+            "i64": 8,
+            "f32": 4,
+            "f64": 8,
+        }
+        return mapping.get(view_mode, 16)
+
+    def on_browser_wheel_navigate(self, delta_y: int) -> bool:
+        view_mode = self._current_browser_view_mode()
+        step_count = max(1, abs(delta_y) // 120) if abs(delta_y) >= 120 else 1
+
+        if view_mode == "disasm":
+            line_delta = -step_count if delta_y > 0 else step_count
+            self._move_disasm_view(line_delta)
+            return True
+
+        current = self.browser_current_addr
+        if current <= 0 and self.browser_addr_input.text().strip():
+            parsed_addr = self._parse_browser_addr()
+            if parsed_addr is None:
+                return False
+            current = parsed_addr
+        size = self._browser_window_size()
+
+        byte_delta = self._browser_scroll_unit(view_mode) * step_count
+        next_addr = max(0, current - byte_delta) if delta_y > 0 else current + byte_delta
+        if self._render_browser_cached_view(next_addr, view_mode):
+            return True
+        self._refresh_browser_view(next_addr, size)
+        return True
 
     @staticmethod
     def _render_hex_dump(addr: int, data: bytes) -> str:
@@ -1996,16 +2356,36 @@ class TcpTestWindow(QWidget):
         return "\n".join(lines)
 
     @staticmethod
-    def _render_disasm_dump(snapshot: dict) -> str:
-        lines: list[str] = []
+    def _extract_disasm_window(snapshot: dict) -> tuple[list[dict], int]:
+        base_addr = TcpTestWindow._safe_int(snapshot.get("base"), 0)
         disasm_list_raw = snapshot.get("disasm")
         disasm_list = disasm_list_raw if isinstance(disasm_list_raw, list) else []
         if not disasm_list:
+            return [], base_addr
+
+        scroll_idx = TcpTestWindow._safe_int(snapshot.get("disasm_scroll_idx"), 0)
+        scroll_idx = max(0, min(scroll_idx, len(disasm_list) - 1))
+        end_idx = min(len(disasm_list), scroll_idx + BROWSER_DISASM_WINDOW_LINES)
+
+        window_items: list[dict] = []
+        for item in disasm_list[scroll_idx:end_idx]:
+            if isinstance(item, dict):
+                window_items.append(item)
+
+        if not window_items:
+            return [], base_addr
+
+        visible_addr = TcpTestWindow._safe_int(window_items[0].get("address"), base_addr)
+        return window_items, visible_addr
+
+    @staticmethod
+    def _render_disasm_dump(snapshot: dict) -> str:
+        lines: list[str] = []
+        window_items, _visible_addr = TcpTestWindow._extract_disasm_window(snapshot)
+        if not window_items:
             return "没有可显示的反汇编结果。"
 
-        for item in disasm_list:
-            if not isinstance(item, dict):
-                continue
+        for item in window_items:
             address_hex = str(item.get("address_hex", "0x0"))
             bytes_hex = str(item.get("bytes_hex", ""))
             mnemonic = str(item.get("mnemonic", "")).strip()
@@ -2035,21 +2415,32 @@ class TcpTestWindow(QWidget):
             return None
         return data
 
-    def _refresh_disasm_view(self, addr: int) -> None:
-        mode_data = self.browser_view_combo.currentData()
-        mode_token = str(mode_data).strip() if mode_data is not None else self._browser_mode_to_token(self.browser_view_combo.currentText().strip())
+    def _open_viewer_snapshot(self, addr: int, mode_token: str) -> dict | None:
         open_resp = self._send_tcp_command(f"viewer.open 0x{addr:X} {mode_token}", log_enabled=False)
         if open_resp is None or not open_resp.startswith("ok "):
             QMessageBox.warning(self, "读取失败", f"打开浏览器失败: {open_resp}")
-            return
+            return None
 
         snapshot = self._read_viewer_snapshot()
         if snapshot is None:
+            return None
+        if not bool(snapshot.get("read_success", False)):
+            QMessageBox.warning(self, "读取失败", "MemViewer 读取失败。")
+            return None
+        return snapshot
+
+    def _refresh_disasm_view(self, addr: int) -> None:
+        mode_data = self.browser_view_combo.currentData()
+        mode_token = str(mode_data).strip() if mode_data is not None else self._browser_mode_to_token(self.browser_view_combo.currentText().strip())
+        snapshot = self._open_viewer_snapshot(addr, mode_token)
+        if not isinstance(snapshot, dict):
             return
 
         base_addr = self._safe_int(snapshot.get("base"), addr)
+        visible_addr = self._extract_disasm_window(snapshot)[1]
         self.browser_base_addr = base_addr
-        self.browser_addr_input.setText(f"0x{base_addr:X}")
+        self.browser_current_addr = visible_addr
+        self.browser_addr_input.setText(f"0x{visible_addr:X}")
         self.browser_view.setPlainText(self._render_disasm_dump(snapshot))
 
     def _move_disasm_view(self, lines: int) -> None:
@@ -2062,27 +2453,35 @@ class TcpTestWindow(QWidget):
         if snapshot is None:
             return
         base_addr = self._safe_int(snapshot.get("base"), 0)
+        visible_addr = self._extract_disasm_window(snapshot)[1]
         self.browser_base_addr = base_addr
-        self.browser_addr_input.setText(f"0x{base_addr:X}")
+        self.browser_current_addr = visible_addr
+        self.browser_addr_input.setText(f"0x{visible_addr:X}")
         self.browser_view.setPlainText(self._render_disasm_dump(snapshot))
 
     def _refresh_browser_view(self, addr: int, size: int) -> None:
-        data = self._read_browser_bytes(addr, size)
-        if data is None:
-            return
-
         mode_data = self.browser_view_combo.currentData()
         view_mode = str(mode_data).strip() if mode_data is not None else self._browser_mode_to_token(self.browser_view_combo.currentText().strip())
-        if view_mode == "hex":
-            text = self._render_hex_dump(addr, data)
-        elif view_mode == "hex64":
-            text = self._render_hex64_dump(addr, data)
-        else:
-            text = self._render_typed_dump(addr, data, view_mode)
-
-        self.browser_base_addr = addr
-        self.browser_addr_input.setText(f"0x{addr:X}")
-        self.browser_view.setPlainText(text)
+        if self._render_browser_cached_view(addr, view_mode):
+            return
+        request_base = self._browser_cache_request_base(addr)
+        snapshot = self._open_viewer_snapshot(request_base, view_mode)
+        if not isinstance(snapshot, dict):
+            return
+        data = self._hex_to_bytes(str(snapshot.get("data_hex", "")))
+        if data is None:
+            QMessageBox.warning(self, "读取失败", "MemViewer HEX 数据解析失败。")
+            return
+        base_addr = self._safe_int(snapshot.get("base"), addr)
+        if size > 0:
+            data = data[:size]
+        self.browser_base_addr = base_addr
+        self.browser_cache_base = base_addr
+        self.browser_cache_data = data
+        if not self._render_browser_cached_view(addr, view_mode):
+            self.browser_current_addr = base_addr
+            self.browser_addr_input.setText(f"0x{base_addr:X}")
+            self.browser_view.setPlainText("缓存长度不足以显示当前视图。")
 
     def on_browser_read(self) -> None:
         mode_data = self.browser_view_combo.currentData()
@@ -2091,47 +2490,16 @@ class TcpTestWindow(QWidget):
             addr = self._parse_browser_addr()
             if addr is None:
                 return
+            self.browser_current_addr = addr
             self._refresh_disasm_view(addr)
             return
 
         addr = self._parse_browser_addr()
         if addr is None:
             return
-        size = self._parse_browser_size()
-        if size is None:
-            return
+        self.browser_current_addr = addr
+        size = self._browser_window_size()
         self._refresh_browser_view(addr, size)
-
-    def on_browser_prev(self) -> None:
-        mode_data = self.browser_view_combo.currentData()
-        view_mode = str(mode_data).strip() if mode_data is not None else self._browser_mode_to_token(self.browser_view_combo.currentText().strip())
-        if view_mode == "disasm":
-            self._move_disasm_view(-10)
-            return
-
-        size = self._parse_browser_size()
-        if size is None:
-            return
-        current = self._parse_browser_addr()
-        if current is None:
-            return
-        next_addr = max(0, current - size)
-        self._refresh_browser_view(next_addr, size)
-
-    def on_browser_next(self) -> None:
-        mode_data = self.browser_view_combo.currentData()
-        view_mode = str(mode_data).strip() if mode_data is not None else self._browser_mode_to_token(self.browser_view_combo.currentText().strip())
-        if view_mode == "disasm":
-            self._move_disasm_view(10)
-            return
-
-        size = self._parse_browser_size()
-        if size is None:
-            return
-        current = self._parse_browser_addr()
-        if current is None:
-            return
-        self._refresh_browser_view(current + size, size)
 
     def _build_pointer_scan_command(self) -> str | None:
         target_text = self.pointer_target_input.text().strip()
@@ -2433,103 +2801,78 @@ class TcpTestWindow(QWidget):
         self._set_status("已移除进程硬件断点")
         self.on_hwbp_refresh(silent=True)
 
-    def on_hwbp_remove_record(self) -> None:
-        text = self.hwbp_record_index_input.text().strip()
-        if text:
-            try:
-                index = int(text, 10)
-            except ValueError:
-                QMessageBox.warning(self, "输入提示", "记录索引必须是整数。")
-                return
-        else:
-            combo_data = self.hwbp_record_combo.currentData()
-            try:
-                index = int(str(combo_data), 10)
-            except (TypeError, ValueError):
-                QMessageBox.warning(self, "输入提示", "请选择有效的 hwbp_record 索引。")
-                return
+    def on_hwbp_tree_current_item_changed(self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None) -> None:
+        if current is None:
+            return
+        field_data = current.data(0, Qt.UserRole + 2)
+        if field_data is not None:
+            field_name = str(field_data)
+            combo_index = self.hwbp_field_combo.findData(field_name)
+            if combo_index >= 0:
+                self.hwbp_field_combo.setCurrentIndex(combo_index)
+        value_data = current.data(0, Qt.UserRole + 3)
+        if value_data is not None:
+            self.hwbp_value_input.setText(str(value_data))
+
+    def on_hwbp_write_field(self) -> None:
+        value_text = self.hwbp_value_input.text().strip()
+        field_data = self.hwbp_field_combo.currentData()
+        field_name = str(field_data).strip() if field_data is not None else ""
+        try:
+            value = int(value_text, 0)
+        except ValueError:
+            QMessageBox.warning(self, "输入提示", "写入值格式无效。")
+            return
+        index = self._get_selected_hwbp_index()
+        if index is None:
+            QMessageBox.warning(self, "输入提示", "请先在断点树里选择一条 hwbp_record。")
+            return
         if index < 0:
             QMessageBox.warning(self, "输入提示", "记录索引不能小于 0。")
             return
-        response = self._send_tcp_command(f"hwbp.record.remove {index}")
+        if not field_name:
+            QMessageBox.warning(self, "输入提示", "请选择要写入的字段。")
+            return
+
+        response = self._send_tcp_command(f"hwbp.record.set {index} {field_name} 0x{value:X}")
         if response is None:
             return
         if not response.startswith("ok "):
-            QMessageBox.warning(self, "删除失败", response)
+            QMessageBox.warning(self, "写入失败", response)
             return
-        self._set_status(f"已删除断点记录索引 {index}")
+
+        self._set_status(f"已写入 hwbp_record[{index}].{field_name}")
         self.on_hwbp_refresh(silent=True)
-
-    def on_hwbp_tree_current_item_changed(self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None) -> None:
-        idx = self._extract_hwbp_index_from_tree_item(current)
-        if idx is None:
-            return
-        self.hwbp_record_index_input.setText(str(idx))
-
-    def on_hwbp_record_combo_changed(self, _index: int) -> None:
-        data = self.hwbp_record_combo.currentData()
-        try:
-            idx = int(str(data), 10)
-        except (TypeError, ValueError):
-            return
-        if idx >= 0:
-            self.hwbp_record_index_input.setText(str(idx))
 
     def on_hwbp_tree_context_menu(self, pos) -> None:
         item = self.hwbp_tree.itemAt(pos)
-        idx = self._extract_hwbp_index_from_tree_item(item)
+        if item is None:
+            item = self.hwbp_tree.currentItem()
+        group_pc = self._extract_hwbp_group_pc_from_tree_item(item)
+        group_payload = self._build_hwbp_group_payload(group_pc if group_pc is not None else -1)
 
         menu = QMenu(self.hwbp_tree)
-        fill_action = menu.addAction("填入当前索引")
-        delete_action = menu.addAction("删除当前 hwbp_record")
-        menu.addSeparator()
-        expand_action = menu.addAction("展开当前节点")
-        collapse_action = menu.addAction("折叠当前节点")
-        expand_all_action = menu.addAction("全部展开")
-        collapse_all_action = menu.addAction("全部折叠")
+        copy_json_action = menu.addAction("复制当前折叠完整JSON")
+        delete_action = menu.addAction("删除当前折叠页")
 
-        if idx is None:
-            fill_action.setEnabled(False)
+        if group_payload is None:
+            copy_json_action.setEnabled(False)
             delete_action.setEnabled(False)
-        if item is None:
-            expand_action.setEnabled(False)
-            collapse_action.setEnabled(False)
 
         action = menu.exec(self.hwbp_tree.mapToGlobal(pos))
         if action is None:
             return
 
-        if action == expand_all_action:
-            self.hwbp_tree.expandAll()
+        if action == copy_json_action:
+            if group_payload is None:
+                return
+            QApplication.clipboard().setText(json.dumps(group_payload, ensure_ascii=False, indent=2))
+            self._set_status(f"已复制 PC 0x{group_payload['pc']:X} 折叠 JSON")
             return
-        if action == collapse_all_action:
-            self.hwbp_tree.collapseAll()
-            return
-        if action == expand_action and item is not None:
-            item.setExpanded(True)
-            return
-        if action == collapse_action and item is not None:
-            item.setExpanded(False)
-            return
-        if idx is None:
-            return
-        if action == fill_action:
-            self.hwbp_record_index_input.setText(str(idx))
-            self._set_status(f"已填入 hwbp_record 索引 {idx}")
-            return
-        if action != delete_action:
+        if action != delete_action or group_payload is None:
             return
 
-        response = self._send_tcp_command(f"hwbp.record.remove {idx}")
-        if response is None:
-            return
-        if not response.startswith("ok "):
-            QMessageBox.warning(self, "删除失败", response)
-            return
-
-        self.hwbp_record_index_input.setText(str(idx))
-        self._set_status(f"已删除 hwbp_record[{idx}]")
-        self.on_hwbp_refresh(silent=True)
+        self._remove_hwbp_group(group_payload)
 
     def _refresh_hwbp_info_live(self) -> None:
         if not self._is_breakpoint_tab_active():
@@ -2566,6 +2909,16 @@ class TcpTestWindow(QWidget):
         self.sig_status_label.setText("特征码状态: 扫描并保存成功")
         self._set_status(f"特征码已保存到 {file_name}")
 
+    def _scan_signature_file_data(self, file_name: str) -> dict | None:
+        response = self._send_tcp_command(f"sig.scan.file {file_name}")
+        if response is None:
+            return None
+        data = self._extract_ok_json(response)
+        if not isinstance(data, dict):
+            QMessageBox.warning(self, "执行失败", f"文件扫描响应异常: {response}")
+            return None
+        return data
+
     def on_sig_filter(self) -> None:
         addr_text = self.sig_verify_addr_input.text().strip()
         file_name = self.sig_file_input.text().strip() or "Signature.txt"
@@ -2582,20 +2935,19 @@ class TcpTestWindow(QWidget):
             QMessageBox.warning(self, "执行失败", f"过滤响应异常: {response}")
             return
         success = bool(data.get("success", False))
-        self._render_signature_data(data, "特征码状态: 过滤成功" if success else "特征码状态: 过滤失败")
+        display_data = data
+        if success:
+            file_data = self._scan_signature_file_data(file_name)
+            if isinstance(file_data, dict):
+                display_data = file_data
+                display_data["success"] = data.get("success", False)
+                display_data["changed_count"] = data.get("changed_count", 0)
+                display_data["total_count"] = data.get("total_count", 0)
+                display_data["old_signature"] = data.get("old_signature", "")
+                display_data["new_signature"] = data.get("new_signature", "")
+                display_data["file"] = data.get("file", file_name)
+        self._render_signature_data(display_data, "特征码状态: 过滤成功" if success else "特征码状态: 过滤失败")
         self._set_status("特征码过滤已完成")
-
-    def on_sig_scan_file(self) -> None:
-        file_name = self.sig_file_input.text().strip() or "Signature.txt"
-        response = self._send_tcp_command(f"sig.scan.file {file_name}")
-        if response is None:
-            return
-        data = self._extract_ok_json(response)
-        if not isinstance(data, dict):
-            QMessageBox.warning(self, "执行失败", f"文件扫描响应异常: {response}")
-            return
-        self._render_signature_data(data, "特征码状态: 文件扫描完成")
-        self._set_status("特征码文件扫描已完成")
 
     def on_sig_scan_pattern(self) -> None:
         pattern = self.sig_pattern_input.text().strip()

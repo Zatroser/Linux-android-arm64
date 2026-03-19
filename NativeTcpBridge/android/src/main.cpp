@@ -42,6 +42,8 @@ namespace Config
     struct Constants
     {
         static constexpr size_t MEM_VIEW_RANGE = 50;
+        // 内存浏览缓存默认保留当前地址上下各 4096 字节。
+        static constexpr size_t MEM_VIEW_DEFAULT_BYTES = 8192;
         static constexpr size_t SCAN_BUFFER = 4096;
         static constexpr size_t BATCH_SIZE = 16384;
         static constexpr size_t MAX_READ_GAP = 64;
@@ -103,13 +105,6 @@ namespace Types
         uintptr_t value;
         auto operator<=>(const MemNode &) const = default;
     };
-
-    namespace Labels
-    {
-        constexpr std::array TYPE = {"Int8", "Int16", "Int32", "Int64", "Float", "Double"};
-        constexpr std::array FUZZY = {"未知", "等于", "大于", "小于", "增加", "减少", "改变", "不变", "范围", "指针"};
-        constexpr std::array FORMAT = {"HexDump", "Hex16", "Hex64", "I8", "I16", "I32", "I64", "Float", "Double", "Disasm"};
-    }
 
     // 编译期大小查表
     namespace detail
@@ -765,7 +760,7 @@ private:
     //  首扫 Unknown — bitmap 全 1 + 记录旧值
     // ================================================================
     template <typename T>
-    void scanFirstUnknown(pid_t pid)
+    void scanFirstUnknown(pid_t /*pid*/)
     {
         auto scanRegs = dr.GetScanRegions();
         if (scanRegs.empty())
@@ -813,7 +808,7 @@ private:
     //  首扫有目标值
     // ================================================================
     template <typename T>
-    void scanFirst(pid_t pid, T target, Types::FuzzyMode mode)
+    void scanFirst(pid_t /*pid*/, T target, Types::FuzzyMode mode)
     {
         auto scanRegs = dr.GetScanRegions();
         if (scanRegs.empty())
@@ -1297,7 +1292,7 @@ private:
     int disasmScrollIdx_ = 0;
 
 public:
-    MemViewer() : buffer_(Config::Constants::MEM_VIEW_RANGE * 2) {}
+    MemViewer() : buffer_(Config::Constants::MEM_VIEW_DEFAULT_BYTES) {}
 
     // 返回当前视图可见状态。
     bool isVisible() const noexcept { return visible_; }
@@ -2116,7 +2111,7 @@ public:
     }
 
     // 执行指针链扫描主流程。
-    void scan(pid_t pid, uintptr_t target, int depth, int maxOffset, bool useManual, uintptr_t manualBase, int manualMaxOffset, bool useArray, uintptr_t arrayBase, size_t arrayCount, const std::string &filterModule)
+    void scan(pid_t /*pid*/, uintptr_t target, int depth, int maxOffset, bool useManual, uintptr_t manualBase, int manualMaxOffset, bool useArray, uintptr_t arrayBase, size_t arrayCount, const std::string &filterModule)
     {
         if (scanning_.exchange(true))
             return;
@@ -2978,6 +2973,52 @@ namespace
         }
     }
 
+    // 按字段名写入硬件断点记录中的寄存器或元数据。
+    bool assignHwbpRecordField(Driver::hwbp_record &record, std::string_view fieldToken, std::uint64_t value)
+    {
+        const std::string token = toLowerAscii(fieldToken);
+        if (token == "pc")
+        {
+            record.pc = value;
+            return true;
+        }
+        if (token == "lr")
+        {
+            record.lr = value;
+            return true;
+        }
+        if (token == "sp")
+        {
+            record.sp = value;
+            return true;
+        }
+        if (token == "pstate")
+        {
+            record.pstate = value;
+            return true;
+        }
+        if (token == "orig_x0")
+        {
+            record.orig_x0 = value;
+            return true;
+        }
+        if (token == "syscallno")
+        {
+            record.syscallno = value;
+            return true;
+        }
+        if (token.size() >= 2 && token[0] == 'x')
+        {
+            const auto regIndex = parseInt(token.substr(1));
+            if (regIndex.has_value() && *regIndex >= 0 && *regIndex < 30)
+            {
+                record.regs[*regIndex] = value;
+                return true;
+            }
+        }
+        return false;
+    }
+
     // 按模板类型解析扫描输入值。
     template <typename T>
     std::optional<T> parseScanValueToken(std::string_view token)
@@ -3297,7 +3338,7 @@ namespace
 
         if (command == "help")
         {
-            return ok("支持命令: ping, pid.get, pid.set, pid.current, pid.attach, hwbp.info, hwbp.set, hwbp.remove, hwbp.record.remove, sig.scan.addr, sig.filter, sig.scan.pattern, sig.scan.file, lock.toggle, lock.set, lock.unset, lock.status, lock.clear, scan.status, scan.clear, scan.first, scan.next, scan.page, scan.add, scan.remove, scan.offset, viewer.open, viewer.move, viewer.offset, viewer.format, viewer.get, pointer.status, pointer.scan, pointer.scan.manual, pointer.scan.array, pointer.merge, pointer.export, mem.read, mem.write, mem.read_u8/u16/u32/u64/f32/f64, mem.write_u8/u16/u32/u64/f32/f64, mem.read_str, mem.read_wstr, memory.refresh, memory.summary, memory.info.full, module.addr, touch.down, touch.move, touch.up");
+            return ok("支持命令: ping, pid.get, pid.set, pid.current, pid.attach, hwbp.info, hwbp.set, hwbp.remove, hwbp.record.remove, hwbp.record.set, sig.scan.addr, sig.filter, sig.scan.pattern, sig.scan.file, lock.toggle, lock.set, lock.unset, lock.status, lock.clear, scan.status, scan.clear, scan.first, scan.next, scan.page, scan.add, scan.remove, scan.offset, viewer.open, viewer.move, viewer.offset, viewer.format, viewer.get, pointer.status, pointer.scan, pointer.scan.manual, pointer.scan.array, pointer.merge, pointer.export, mem.read, mem.write, mem.read_u8/u16/u32/u64/f32/f64, mem.write_u8/u16/u32/u64/f32/f64, mem.read_str, mem.read_wstr, memory.refresh, memory.summary, memory.info.full, module.addr, touch.down, touch.move, touch.up");
         }
 
         if (command == "ping")
@@ -3427,6 +3468,37 @@ namespace
             dr.RemoveHwbpRecord(*index);
             const auto &updated = dr.GetHwbpInfoRef();
             return ok(std::format("record_count={}", updated.record_count));
+        }
+
+        if (command == "hwbp.record.set")
+        {
+            if (tokens.size() != 4)
+            {
+                return err("用法: hwbp.record.set <索引> <字段> <值>");
+            }
+
+            const auto index = parseInt(tokens[1]);
+            const auto value = parseUInt64(tokens[3]);
+            if (!index.has_value() || *index < 0 || !value.has_value())
+            {
+                return err("索引或值无效");
+            }
+
+            const auto &info = dr.GetHwbpInfoRef();
+            if (*index >= info.record_count)
+            {
+                return err("索引越界");
+            }
+
+            auto copy = info.records[*index];
+            if (!assignHwbpRecordField(copy, tokens[2], *value))
+            {
+                return err("字段无效，支持: pc/lr/sp/pstate/orig_x0/syscallno/x0~x29");
+            }
+
+            copy.rw = true;
+            const_cast<Driver::hwbp_record &>(dr.GetHwbpInfoRef().records[*index]) = copy;
+            return ok(std::format("index={} field={} value=0x{:X}", *index, tokens[2], *value));
         }
 
         if (command == "sig.scan.addr")
