@@ -4594,10 +4594,6 @@ namespace
                 {"name", "structured"},
                 {"fields", json::array({"operation", "params"})},
             },
-            {
-                {"name", "legacy"},
-                {"fields", json::array({"command", "args"})},
-            },
         });
         payload["operations"] = json::array({
             "bridge.describe",
@@ -5103,8 +5099,6 @@ namespace
         json out = buildJsonResponseFromText(textResponse);
         out["session_id"] = session->sessionId;
         out["operation"] = std::string(operation);
-        const auto commandTokens = splitTokens(textCommand);
-        out["command"] = commandTokens.empty() ? "" : commandTokens[0];
         return out;
     }
 
@@ -5143,47 +5137,7 @@ namespace
             return tryDispatchStructuredOperation(session, operationName, params).dump();
         }
 
-        if (!parsedReq.contains("command") || !parsedReq["command"].is_string())
-        {
-            return makeProtocolError("请求缺少 command 或 operation 字段").dump();
-        }
-
-        const std::string commandName = parsedReq["command"].get<std::string>();
-        std::string textCommand = commandName;
-
-        if (parsedReq.contains("args"))
-        {
-            if (!parsedReq["args"].is_array())
-            {
-                return json({{"ok", false}, {"error", "args 字段必须是数组"}}).dump();
-            }
-
-            for (const auto &arg : parsedReq["args"])
-            {
-                std::string token;
-                if (arg.is_string())
-                {
-                    token = arg.get<std::string>();
-                }
-                else if (arg.is_boolean() || arg.is_number_integer() || arg.is_number_unsigned() || arg.is_number_float())
-                {
-                    token = arg.dump();
-                }
-                else
-                {
-                    return json({{"ok", false}, {"error", "args 仅支持字符串、数字、布尔值"}}).dump();
-                }
-
-                textCommand.push_back(' ');
-                textCommand.append(token);
-            }
-        }
-
-        const std::string textResponse = DispatchTextCommand(session, textCommand);
-        json out = buildJsonResponseFromText(textResponse);
-        out["session_id"] = session->sessionId;
-        out["command"] = commandName;
-        return out.dump();
+        return makeProtocolError("请求缺少 operation 字段").dump();
     }
 
     void HandleClientConnection(int clientFd, sockaddr_in clientAddr)

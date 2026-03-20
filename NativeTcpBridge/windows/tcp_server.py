@@ -87,14 +87,6 @@ class BridgeResponse:
             payload["error"] = self.error
         return payload
 
-    def as_legacy_text(self) -> str:
-        if not self.ok:
-            return f"err {self.error or 'unknown bridge error'}"
-        if self.data is not None:
-            return "ok " + json.dumps(self.data, ensure_ascii=False)
-        return f"ok {self.message}".rstrip()
-
-
 def parse_message_pairs(message: str) -> dict[str, str]:
     pairs: dict[str, str] = {}
     for token in str(message).split():
@@ -359,12 +351,6 @@ class AndroidBridgeSession:
     def call_operation(self, operation: str, params: dict[str, Any] | None = None) -> BridgeResponse:
         return self.request({"operation": operation.strip(), "params": params or {}})
 
-    def call_command(self, command: str, args: list[Any] | None = None) -> BridgeResponse:
-        raise BridgeProtocolError("unified mode only: use call_operation(operation, params)")
-
-    def call_legacy_text(self, command_text: str) -> str:
-        raise BridgeProtocolError("unified mode only: use call_operation(operation, params)")
-
     def _read_response_object(self) -> dict[str, Any]:
         if self._sock is None:
             raise BridgeConnectionError("bridge session is not connected")
@@ -484,12 +470,6 @@ class AndroidBridgeClient:
     def call_operation(self, operation: str, params: dict[str, Any] | None = None) -> BridgeResponse:
         request = {"operation": operation.strip(), "params": params or {}}
         return self._call_with_discovery(request, fallback_operation=operation.strip())
-
-    def call_command(self, command: str, *args: Any) -> BridgeResponse:
-        raise BridgeProtocolError("unified mode only: use call_operation(operation, params)")
-
-    def call_legacy_text(self, command_text: str) -> str:
-        raise BridgeProtocolError("unified mode only: use call_operation(operation, params)")
 
     def describe(self) -> dict[str, Any]:
         return self.call_operation("bridge.describe").require_ok().to_dict()
