@@ -102,10 +102,8 @@ public:                // 外部初始化
 
 public: // 共有结构体和锁
         // 轻量高性能自旋锁
-#if defined(_MSC_VER)
-#include <intrin.h>
-#elif defined(__i386__) || defined(__x86_64__)
-#include <immintrin.h>
+#if !defined(__clang__) || !defined(__ANDROID__) || !defined(__aarch64__)
+#error "Driver::SpinLock only supports Clang on Android arm64."
 #endif
     class SpinLock
     {
@@ -113,13 +111,7 @@ public: // 共有结构体和锁
 
         inline void pause() const noexcept
         {
-#if defined(_MSC_VER)
-            _mm_pause();
-#elif defined(__i386__) || defined(__x86_64__)
-            _mm_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-            __asm__ volatile("yield" ::: "memory");
-#endif
+            __builtin_arm_yield();
         }
 
     public:
@@ -703,9 +695,7 @@ public: // 外部获取内存信息
             return false;
         }
 
-        // ========================================
-        // 第一步：确定模块的内存跨度
-        // ========================================
+        // 确定模块的内存跨度
         uint64_t baseAddr = ~0ULL;
         uint64_t maxEnd = 0;
 
@@ -732,14 +722,10 @@ public: // 外部获取内存信息
         std::println(stdout, "[*] 结束: 0x{:X}", maxEnd);
         std::println(stdout, "[*] 跨度: 0x{:X} ({} MB)", imageSize, imageSize / 1024 / 1024);
 
-        // ========================================
-        // 第二步：分配缓冲区 (默认全 0，完美兼容 BSS 和 PROT_NONE 空白页)
-        // ========================================
+        // 分配缓冲区 (默认全 0，完美兼容 BSS 和 PROT_NONE 空白页)
         std::vector<uint8_t> image(imageSize, 0);
 
-        // ========================================
-        // 第三步：分层智能内存读取 (解决失败率极高的问题)
-        // ========================================
+        // 分层内存读取
         size_t totalRead = 0;
         size_t failedPages = 0;
 
@@ -776,14 +762,12 @@ public: // 外部获取内存信息
         }
         std::println(stdout, "[*] 读取完成: 成功 0x{:X} 字节, 失败 {} 页", totalRead, failedPages);
 
-        // ========================================
-        // 第四步：高级 ELF 修复 (IDA 完美解析核心)
-        // ========================================
+        // ELF 修复
         if (totalRead >= sizeof(Elf64_Ehdr))
         {
             Elf64_Ehdr *ehdr = reinterpret_cast<Elf64_Ehdr *>(image.data());
 
-            if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) == 0 && ehdr->e_ident[EI_CLASS] == ELFCLASS64)
+            if (__builtin_memcmp(ehdr->e_ident, ELFMAG, SELFMAG) == 0 && ehdr->e_ident[EI_CLASS] == ELFCLASS64)
             {
                 std::println(stdout, "[*] ELF 虚拟基址: 0x0 (1:1 内存映射展开)");
 
@@ -907,10 +891,11 @@ public: // 外部硬件断点接口
     {
         if (index < 0 || index >= req->bp_info.record_count)
             return;
-        for (int i = index; i < req->bp_info.record_count - 1; ++i)
-            req->bp_info.records[i] = req->bp_info.records[i + 1];
+        const int tail_count = req->bp_info.record_count - index - 1;
+        if (tail_count > 0)
+            __builtin_memmove(&req->bp_info.records[index], &req->bp_info.records[index + 1], static_cast<size_t>(tail_count) * sizeof(hwbp_record));
         req->bp_info.record_count--;
-        memset(&req->bp_info.records[req->bp_info.record_count], 0, sizeof(hwbp_record));
+        __builtin_memset(&req->bp_info.records[req->bp_info.record_count], 0, sizeof(hwbp_record));
     }
 
 private: // 私有实现，外部无需关系
@@ -942,7 +927,7 @@ private: // 私有实现，外部无需关系
             printf("[-] 分配共享内存失败，错误码: %d (%s)\n", errno, strerror(errno));
             return;
         }
-        memset(req, 0, sizeof(req_obj));
+        __builtin_memset(req, 0, sizeof(req_obj));
 
         printf("[+] 分配虚拟地址成功，地址: %p  大小: %lu\n", req, sizeof(req_obj));
         printf("当前进程 PID: %d\n", getpid());
@@ -1235,7 +1220,6 @@ namespace SignatureScanner
                 return std::string(path);
             return std::string("/data/akernel/") + std::string(path);
         }
-
 
         std::string FormatSignature(const SigElement &sig)
         {

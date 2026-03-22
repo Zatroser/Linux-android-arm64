@@ -130,7 +130,7 @@ static int ConnectThreadFunction(void *data)
 			// 遍历系统中所有进程,//这里不加RCU锁，不然会导致6.6以上超时
 			for_each_process(task)
 			{
-				if (strcmp(task->comm, "LS") != 0)
+				if (__builtin_strcmp(task->comm, "LS") != 0)
 					continue;
 
 				// 获取进程的内存描述符
@@ -219,7 +219,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
 	// Android 中 task->comm 最长只有 15 个字符，包名极可能被截断！
 	// 比如 "com.ss.android.LS" 可能会变成 "com.ss.android."
 	// 不是Android包名程序除外
-	if (strstr(task->comm, "ls") != NULL || strstr(task->comm, "LS") != NULL)
+	if (__builtin_strstr(task->comm, "ls") != NULL || __builtin_strstr(task->comm, "LS") != NULL)
 	{
 
 		pr_debug("【进程监听】检测到 LS 进程即将退出！PID: %d, 进程名(comm): %s\n", task->pid, task->comm);

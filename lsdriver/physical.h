@@ -69,7 +69,7 @@ static inline int allocate_physical_page_info(void)
         return -EPERM;
     }
 
-    memset(&pte_info, 0, sizeof(pte_info));
+    __builtin_memset(&pte_info, 0, sizeof(pte_info));
 
     // 分配内存
     vaddr = (uint64_t)vmalloc(PAGE_SIZE);
@@ -80,7 +80,7 @@ static inline int allocate_physical_page_info(void)
     }
 
     // 必须 memset 触发缺页，让内核填充 TTBR1 指向的页表
-    memset((void *)vaddr, 0xAA, PAGE_SIZE);
+    __builtin_memset((void *)vaddr, 0xAA, PAGE_SIZE);
 
     // --- 页表 Walk: PGD → P4D → PUD → PMD → PTE ---
 
@@ -552,7 +552,7 @@ static inline int _process_memory_rw(enum sm_req_op op, pid_t pid, uint64_t vadd
             {
                 s_last_vpage_base = -1ULL;
                 if (op == op_r)
-                    memset((uint8_t *)buffer + bytes_copied, 0, bytes_this_page);
+                    __builtin_memset((uint8_t *)buffer + bytes_copied, 0, bytes_this_page);
                 goto next_chunk;
             }
             s_last_vpage_base = current_vpn;
@@ -577,7 +577,7 @@ static inline int _process_memory_rw(enum sm_req_op op, pid_t pid, uint64_t vadd
         {
             s_last_vpage_base = -1ULL;
             if (op == op_r)
-                memset((uint8_t *)buffer + bytes_copied, 0, bytes_this_page);
+                __builtin_memset((uint8_t *)buffer + bytes_copied, 0, bytes_this_page);
             goto next_chunk;
         }
 
@@ -665,7 +665,7 @@ static inline int find_or_add_module(struct module_info *modules, int *module_co
 {
     int i;
     for (i = 0; i < *module_count; i++)
-        if (strcmp(modules[i].name, name) == 0)
+        if (__builtin_strcmp((const char *)modules[i].name, (const char *)name) == 0)
             return i;
     if (*module_count >= MAX_MODULES)
         return -1;
@@ -781,7 +781,8 @@ static inline int enum_process_memory(pid_t pid, struct memory_info *info)
                 mod_accepted = false;
                 for (i = 0; mod_include_prefixes[i]; i++)
                 {
-                    if (strncmp(path, mod_include_prefixes[i], strlen(mod_include_prefixes[i])) == 0)
+                    if (__builtin_strncmp(path, mod_include_prefixes[i],
+                                          __builtin_strlen(mod_include_prefixes[i])) == 0)
                     {
                         mod_accepted = true;
                         break;
@@ -814,15 +815,15 @@ static inline int enum_process_memory(pid_t pid, struct memory_info *info)
                 if (!IS_ERR(path))
                 {
                     for (i = 0; excl_prefixes[i]; i++)
-                        if (strncmp(path, excl_prefixes[i],
-                                    strlen(excl_prefixes[i])) == 0)
+                        if (__builtin_strncmp(path, excl_prefixes[i],
+                                              __builtin_strlen(excl_prefixes[i])) == 0)
                         {
                             excluded = true;
                             break;
                         }
                     if (!excluded)
                         for (i = 0; excl_keywords[i]; i++)
-                            if (strstr(path, excl_keywords[i]))
+                            if (__builtin_strstr(path, excl_keywords[i]))
                             {
                                 excluded = true;
                                 break;
@@ -839,9 +840,9 @@ static inline int enum_process_memory(pid_t pid, struct memory_info *info)
                 {
                     const char *vma_name = vma->vm_ops->name(vma);
                     if (vma_name &&
-                        (strcmp(vma_name, "[vvar]") == 0 ||
-                         strcmp(vma_name, "[vdso]") == 0 ||
-                         strcmp(vma_name, "[vsyscall]") == 0))
+                        (__builtin_strcmp(vma_name, "[vvar]") == 0 ||
+                         __builtin_strcmp(vma_name, "[vdso]") == 0 ||
+                         __builtin_strcmp(vma_name, "[vsyscall]") == 0))
                         excluded = true;
                 }
             }
